@@ -88,9 +88,10 @@ type WorkerEnvironmentServiceOptions = {
     profile: WorkerProfile;
     keyRef: SecretRef;
   }) => Promise<WorkerSshIdentity>;
-  resolveNodeWorkerBuild?: (deviceId: string) => Promise<WorkerAdmissionHandshake | undefined>;
+  ensureNodeWorkerBundle?: (deviceId: string) => Promise<WorkerAdmissionHandshake>;
   tunnelManager?: WorkerTunnelManager;
   nodeTunnelManager?: NodeWorkerTunnelManager;
+  stopNodeWorkerBundleTransfers?: () => void;
   reconcileIntervalMs?: number;
   providerCallTimeoutMs?: number;
   bootstrapCallTimeoutMs?: number;
@@ -278,7 +279,7 @@ export function createWorkerEnvironmentService(options: WorkerEnvironmentService
     prepareInstallation: options.prepareInstallation,
     bootstrapWorker: options.bootstrapWorker,
     resolveSshIdentity: options.resolveSshIdentity,
-    resolveNodeWorkerBuild: options.resolveNodeWorkerBuild,
+    ensureNodeWorkerBundle: options.ensureNodeWorkerBundle,
     providerCallTimeoutMs: options.providerCallTimeoutMs,
     tunnelManager: tunnelLifecycle,
     credentialBroker,
@@ -388,6 +389,7 @@ export function createWorkerEnvironmentService(options: WorkerEnvironmentService
     await inference.stop();
     credentialBroker.clear();
     options.liveEvents?.clear();
+    options.stopNodeWorkerBundleTransfers?.();
     await environmentAccess.stopAllTunnels();
     const reconciliation = reconcileInFlight;
     if (reconciliation) {

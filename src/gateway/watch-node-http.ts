@@ -24,6 +24,7 @@ import {
   deriveDeviceIdFromPublicKey,
   normalizeDevicePublicKeyBase64Url,
 } from "../infra/device-identity.js";
+import { approveBootstrapDevicePairing } from "../infra/device-pairing-approval.js";
 import { captureAuthenticatedNodePairingState } from "../infra/device-pairing-node-state.js";
 import {
   approveNodePairing,
@@ -35,13 +36,11 @@ import {
   recordPairedNodeDisconnection,
   type RequestNodePairingResult,
 } from "../infra/device-pairing-node.js";
+import { ensureDeviceToken, verifyDeviceToken } from "../infra/device-pairing-tokens.js";
 import {
-  approveBootstrapDevicePairing,
-  ensureDeviceToken,
   getPairedDevice,
   requestDevicePairing,
   resolveNodePairingState,
-  verifyDeviceToken,
 } from "../infra/device-pairing.js";
 import { pruneMapToMaxSize } from "../infra/map-size.js";
 import { isNodePairingSetupBootstrapProfile } from "../shared/device-bootstrap-profile.js";
@@ -69,10 +68,8 @@ import {
 } from "./http-common.js";
 import { ADMIN_SCOPE, PAIRING_SCOPE, WRITE_SCOPE } from "./method-scopes.js";
 import { isLoopbackAddress, resolveRequestClientIp } from "./net.js";
-import {
-  reconcileNodePairingOnConnect,
-  resolveEffectiveComputerUseDescriptor,
-} from "./node-connect-reconcile.js";
+import { resolveEffectiveComputerUseDescriptor } from "./node-computer-use-descriptor.js";
+import { reconcileNodePairingOnConnect } from "./node-connect-reconcile.js";
 import type { NodeReapprovalCoordinator } from "./node-reapproval-coordinator.js";
 import type {
   NodeConnectivityResult,
@@ -872,10 +869,12 @@ export function createWatchNodeHttpRuntime(options: WatchNodeHttpRuntimeOptions)
       const registeredConnect = connect as ConnectParams & {
         declaredCaps?: string[];
         declaredCommands?: string[];
+        declaredComputerUse?: unknown;
         declaredPermissions?: Record<string, boolean>;
       };
       registeredConnect.declaredCaps = reconciliation.declaredCaps;
       registeredConnect.declaredCommands = reconciliation.declaredCommands;
+      registeredConnect.declaredComputerUse = reconciliation.declaredComputerUse;
       registeredConnect.declaredPermissions = reconciliation.declaredPermissions;
       registeredConnect.caps = reconciliation.effectiveCaps;
       registeredConnect.commands = reconciliation.effectiveCommands;

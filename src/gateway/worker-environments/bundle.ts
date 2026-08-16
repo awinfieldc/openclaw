@@ -9,15 +9,16 @@ import { isExactSemverVersion, resolveNpmJsonEntries } from "../../infra/npm-reg
 import { resolveOpenClawPackageRootSync } from "../../infra/openclaw-root.js";
 import { runCommandWithTimeout } from "../../process/exec.js";
 import {
+  DEFAULT_WORKER_BUNDLE_ARCHIVE_LIMITS,
+  readWorkerBundleArchiveManifest,
+} from "../../shared/worker-bundle-archive.js";
+import {
+  compareWorkerBundlePaths,
   hashWorkerBundleManifest,
   WORKER_BUNDLE_MANIFEST_VERSION,
 } from "../../shared/worker-bundle-hash.js";
 import { VERSION } from "../../version.js";
-import {
-  collectWorkerBundleManifest,
-  comparePaths,
-  type WorkerBundleManifestEntry,
-} from "./bundle-staging.js";
+import { collectWorkerBundleManifest, type WorkerBundleManifestEntry } from "./bundle-staging.js";
 
 export { WORKER_BUNDLE_MANIFEST_VERSION };
 const OPENCLAW_NPM_REGISTRY = "https://registry.npmjs.org/";
@@ -73,7 +74,7 @@ function normalizeProtocolFeatures(features: readonly string[]): string[] {
   if (normalized.some((feature) => feature.length === 0)) {
     throw new Error("Worker protocol features must be non-empty strings");
   }
-  return [...new Set(normalized)].toSorted(comparePaths);
+  return [...new Set(normalized)].toSorted(compareWorkerBundlePaths);
 }
 
 function resolveBundleCacheDir(cacheDir: string | undefined): string {
@@ -307,63 +308,6 @@ function manifestsMatch(
   );
 }
 
-async function readTarballManifest(tarballPath: string): Promise<WorkerBundleManifestEntry[]> {
-  const pending: Array<{
-    path: string;
-    mode: number | undefined;
-    headerSize: number;
-    actualSize: number;
-    type: string;
-    sha256?: string;
-    error?: Error;
-  }> = [];
-  await tar.list({
-    file: tarballPath,
-    strict: true,
-    onReadEntry(entry) {
-      const hash = createHash("sha256");
-      const item = {
-        path: entry.path,
-        mode: entry.mode,
-        headerSize: entry.size,
-        actualSize: 0,
-        type: entry.type,
-      } as (typeof pending)[number];
-      pending.push(item);
-      entry.on("data", (chunk: Buffer) => {
-        item.actualSize += chunk.byteLength;
-        hash.update(chunk);
-      });
-      entry.on("end", () => {
-        item.sha256 = hash.digest("hex");
-      });
-      entry.on("error", (error) => {
-        item.error = error instanceof Error ? error : new Error(String(error));
-      });
-    },
-  });
-  const entries = pending.map((entry): WorkerBundleManifestEntry => {
-    if (entry.error) {
-      throw entry.error;
-    }
-    if (
-      entry.type !== "File" ||
-      entry.mode === undefined ||
-      entry.actualSize !== entry.headerSize ||
-      entry.sha256 === undefined
-    ) {
-      throw new Error(`Invalid worker bundle tar entry: ${entry.path}`);
-    }
-    return {
-      path: entry.path,
-      mode: entry.mode,
-      size: entry.actualSize,
-      sha256: entry.sha256,
-    };
-  });
-  return entries.toSorted((left, right) => comparePaths(left.path, right.path));
-}
-
 async function isCachedTarball(filePath: string): Promise<boolean> {
   try {
     const stats = await fs.lstat(filePath);
@@ -387,7 +331,10 @@ async function cachedTarballMatches(
     return false;
   }
   try {
-    return manifestsMatch(await readTarballManifest(tarballPath), manifest);
+    return manifestsMatch(
+      await readWorkerBundleArchiveManifest(tarballPath, DEFAULT_WORKER_BUNDLE_ARCHIVE_LIMITS),
+      manifest,
+    );
   } catch {
     return false;
   }
@@ -460,7 +407,9 @@ async function pruneWorkerBundleCache(params: {
     }
     return;
   }
-  for (const entry of entries.toSorted((left, right) => comparePaths(left.name, right.name))) {
+  for (const entry of entries.toSorted((left, right) =>
+    compareWorkerBundlePaths(left.name, right.name),
+  )) {
     const tarball = BUNDLE_TARBALL_NAME_PATTERN.exec(entry.name);
     const removableTarball = tarball && !retained.has(tarball[1]!);
     const removableStaging = BUNDLE_STAGING_NAME_PATTERN.test(entry.name);

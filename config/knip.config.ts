@@ -24,6 +24,8 @@ const repositoryScriptEntries = [
   "scripts/check-package-dist-imports.mjs!",
   // Cloudflare deployment template: wrangler bundles the Worker from this entry.
   "scripts/cloudflare/src/index.ts!",
+  // Invoked by the documented macOS Computer Use live-proof shell rig.
+  "scripts/dev/computer-use-macos-live-proof.ts!",
   "scripts/dev/ios-node-e2e.ts!",
   "scripts/diffs-shiki-curated.ts!",
   // Reusable Docker workflows invoke this from the downloaded .release-harness tree.
@@ -810,6 +812,8 @@ const config = {
       "web/vite.config.ts!",
       // Imported directly from the GitHub Actions smoke-plan script.
       "src/ci-smoke-plan.ts!",
+      // Imported directly from the GitHub Actions evidence workflow.
+      "src/profile-evidence-sharding.ts!",
     ]),
     [`${BUNDLED_PLUGIN_ROOT_DIR}/senseaudio`]: bundledPluginWorkspace(),
     [`${BUNDLED_PLUGIN_ROOT_DIR}/tavily`]: bundledPluginWorkspace(),

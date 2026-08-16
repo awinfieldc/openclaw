@@ -2756,7 +2756,10 @@ describe("chat directive tag stripping for non-streaming final payloads", () => 
     );
     mockState.sessionIdsByKey.set(targetSessionKey, targetSessionId);
     mockState.finalPayload = setReplyPayloadMetadata(
-      { text: "bound history reply" },
+      {
+        text: "bound history reply",
+        mediaUrl: `data:image/png;base64,${TINY_PNG_BASE64}`,
+      },
       {
         sourceReplyTranscriptMirror: {
           sessionKey: targetSessionKey,
@@ -2783,6 +2786,30 @@ describe("chat directive tag stripping for non-streaming final payloads", () => 
       agentId: "main",
       sessionKey: `agent:main:${targetSessionKey}`,
     });
+    expect(JSON.stringify(assistantUpdate?.message)).toContain(
+      `/api/chat/media/outgoing/${encodeURIComponent(targetSessionKey)}/`,
+    );
+    expect(JSON.stringify(assistantUpdate?.message)).not.toContain(
+      "/api/chat/media/outgoing/agent%3Amain%3Amain/",
+    );
+  });
+
+  it("replaces failed managed media with bounded visible guidance", async () => {
+    await createTranscriptFixture("openclaw-chat-send-managed-media-failure-");
+    const source = "data:audio/mpeg;base64,not-valid!";
+    mockState.finalPayload = { mediaUrl: source };
+    const { send } = createChatRequestFixture();
+
+    const payload = await send({ idempotencyKey: "idem-managed-media-failure" });
+
+    const serialized = JSON.stringify(payload?.message);
+    expect(serialized).toContain(
+      "⚠️ Media failed. Try sending a smaller supported file or a different format.",
+    );
+    expect(serialized).not.toContain(source);
+    expect(Buffer.byteLength(serialized)).toBeLessThan(1_024);
+    const assistantEntries = await readActiveAssistantTranscriptMessages();
+    expect(JSON.stringify(assistantEntries)).not.toContain(source);
   });
 
   it("does not cross a plugin-bound session rotation during finalization", async () => {
@@ -4494,10 +4521,15 @@ describe("chat directive tag stripping for non-streaming final payloads", () => 
     expect(finalBroadcasts).toStrictEqual([]);
   });
 
-  it("broadcasts returned agent-run error payloads after an agent starts", async () => {
+  it.each([
+    ["after start", true],
+    ["before launch", false],
+  ] as const)("broadcasts returned agent-run error payloads $0", async (_name, agentStarted) => {
     await createGatewayUserTurnSqliteFixture("openclaw-chat-send-agent-returned-error-");
-    const errorMessage = "LLM idle timeout (120s): no response from model";
-    mockState.triggerAgentRunStart = true;
+    const errorMessage = agentStarted
+      ? "LLM idle timeout (120s): no response from model"
+      : "Worker must bootstrap the current build before continuing";
+    mockState.triggerAgentRunStart = agentStarted;
     mockState.dispatchedReplies = [
       {
         kind: "final",
@@ -4508,23 +4540,24 @@ describe("chat directive tag stripping for non-streaming final payloads", () => 
       },
     ];
     const { context, send } = createChatRequestFixture();
+    const runId = agentStarted ? "idem-agent-returned-error" : "idem-agent-rejected-before-launch";
 
     const broadcast = await send({
-      idempotencyKey: "idem-agent-returned-error",
+      idempotencyKey: runId,
       message: "please keep working",
     });
 
     expect(broadcast).toMatchObject({
-      runId: "idem-agent-returned-error",
+      runId,
       sessionKey: "agent:main:main",
       state: "error",
       errorMessage,
     });
     expect(broadcast).not.toHaveProperty("message");
-    const dedupe = context.dedupe.get("chat:idem-agent-returned-error");
+    const dedupe = context.dedupe.get(`chat:${runId}`);
     expect(dedupe?.ok).toBe(false);
     expect(dedupe?.payload).toMatchObject({
-      runId: "idem-agent-returned-error",
+      runId,
       status: "error",
       summary: errorMessage,
     });
