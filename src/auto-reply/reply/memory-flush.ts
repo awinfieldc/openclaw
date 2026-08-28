@@ -42,6 +42,23 @@ function resolvePositiveTokenCount(value: number | undefined): number | undefine
     : undefined;
 }
 
+/** Resolves the maintenance threshold owned by the selected memory provider. */
+export function resolveMemoryFlushThreshold(params: {
+  contextWindowTokens: number;
+  reserveTokensFloor: number;
+  softThresholdTokens: number;
+  minimumThresholdTokens?: number;
+}): number {
+  const contextWindow = Math.max(1, Math.floor(params.contextWindowTokens));
+  const reserveTokens = Math.max(0, Math.floor(params.reserveTokensFloor));
+  const softThreshold = Math.max(0, Math.floor(params.softThresholdTokens));
+  return Math.max(
+    0,
+    contextWindow - reserveTokens - softThreshold,
+    Math.floor(params.minimumThresholdTokens ?? 0),
+  );
+}
+
 export function resolveResponsesServerCompactionThreshold(params: {
   cfg?: OpenClawConfig;
   provider?: string;
@@ -81,6 +98,11 @@ export function resolveResponsesServerCompactionThreshold(params: {
   }
   const defaultOpenAIBaseUrl =
     normalizedProvider === "openai" ? "https://api.openai.com/v1" : undefined;
+  const activeContextTokens = resolveMemoryFlushContextWindowTokens({
+    cfg: params.cfg,
+    provider,
+    modelId,
+  });
   return resolveOpenAIResponsesServerCompactionPlan(
     {
       provider,
@@ -90,9 +112,8 @@ export function resolveResponsesServerCompactionThreshold(params: {
         (normalizedProvider === "openai" ? "openai-responses" : undefined),
       baseUrl: configuredModel?.baseUrl ?? providerConfig?.baseUrl ?? defaultOpenAIBaseUrl,
       compat: configuredModel?.compat,
-      contextWindow:
-        configuredModel?.contextWindow ??
-        resolveMemoryFlushContextWindowTokens({ cfg: params.cfg, provider, modelId }),
+      contextTokens: configuredModel?.contextTokens ?? activeContextTokens,
+      contextWindow: configuredModel?.contextWindow ?? activeContextTokens,
     },
     extraParams,
   ).threshold;
@@ -118,19 +139,8 @@ function resolveMemoryFlushGateState<
     return null;
   }
 
-  const contextWindow = Math.max(1, Math.floor(params.contextWindowTokens));
-  const reserveTokens = Math.max(0, Math.floor(params.reserveTokensFloor));
-  const softThreshold = Math.max(0, Math.floor(params.softThresholdTokens));
-  const threshold = Math.max(
-    0,
-    contextWindow - reserveTokens - softThreshold,
-    Math.floor(params.minimumThresholdTokens ?? 0),
-  );
-  if (threshold <= 0) {
-    return null;
-  }
-
-  return { entry: params.entry, totalTokens, threshold };
+  const threshold = resolveMemoryFlushThreshold(params);
+  return threshold > 0 ? { entry: params.entry, totalTokens, threshold } : null;
 }
 
 export function shouldRunMemoryFlush(params: {

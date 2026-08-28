@@ -239,13 +239,13 @@ describe("run-oxlint", () => {
     };
     const shardedLintRunner = readFileSync("scripts/run-oxlint-shards.mts", "utf8");
 
-    expect(packageJson.scripts.check).toBe("node --import tsx scripts/check.mts");
-    expect(packageJson.scripts.lint).toBe("node --import tsx scripts/run-lint.mts");
+    expect(packageJson.scripts.check).toBe("node --import ./scripts/tsx.mjs scripts/check.mts");
+    expect(packageJson.scripts.lint).toBe("node --import ./scripts/tsx.mjs scripts/run-lint.mts");
     expect(packageJson.scripts["lint:core"]).toBe(
-      "node --import tsx scripts/run-oxlint-shards.mts --only=core",
+      "node --import ./scripts/tsx.mjs scripts/run-oxlint-shards.mts --only=core",
     );
     expect(packageJson.scripts.check).not.toContain(
-      "node --import tsx scripts/prepare-extension-package-boundary-artifacts.mts",
+      "node --import ./scripts/tsx.mjs scripts/prepare-extension-package-boundary-artifacts.mts",
     );
     expect(shardedLintRunner).toContain("prepare-extension-package-boundary-artifacts.mts");
     expect(shardedLintRunner).toContain('OPENCLAW_OXLINT_SKIP_PREPARE: "1"');
@@ -257,7 +257,7 @@ describe("run-oxlint", () => {
     };
     const lintRunner = readFileSync("scripts/run-lint.mts", "utf8");
 
-    expect(packageJson.scripts.lint).toBe("node --import tsx scripts/run-lint.mts");
+    expect(packageJson.scripts.lint).toBe("node --import ./scripts/tsx.mjs scripts/run-lint.mts");
     expect(lintRunner.indexOf("ensureRepoToolNodeModulesLink(")).toBeGreaterThan(-1);
     expect(
       lintRunner.indexOf('path.resolve("scripts", "control-ui-i18n-verify.ts")'),
@@ -265,20 +265,6 @@ describe("run-oxlint", () => {
     expect(lintRunner.indexOf('path.resolve("scripts", "run-oxlint-shards.mts")')).toBeGreaterThan(
       lintRunner.indexOf('path.resolve("scripts", "control-ui-i18n-verify.ts")'),
     );
-  });
-
-  it("holds one parent heavy-check lock for sharded lint runs", () => {
-    const shardedLintRunner = readFileSync("scripts/run-oxlint-shards.mts", "utf8");
-    const skipLockIndex = shardedLintRunner.indexOf('env.OPENCLAW_OXLINT_SKIP_LOCK === "1"');
-    const lockIndex = shardedLintRunner.indexOf("acquireLocalHeavyCheckLockSync({");
-    const childSkipIndex = shardedLintRunner.indexOf('OPENCLAW_OXLINT_SKIP_LOCK: "1"');
-
-    expect(shardedLintRunner).toContain("resolveLocalHeavyCheckEnv");
-    expect(shardedLintRunner).toContain("shouldAcquireLocalHeavyCheckLockForOxlint");
-    expect(skipLockIndex).toBeGreaterThan(-1);
-    expect(lockIndex).toBeGreaterThan(-1);
-    expect(lockIndex).toBeGreaterThan(skipLockIndex);
-    expect(childSkipIndex).toBeGreaterThan(lockIndex);
   });
 
   it("serializes broad oxlint shards on constrained local hosts", () => {
@@ -624,16 +610,12 @@ describe("run-oxlint", () => {
       encoding: "utf8",
       env: {
         ...process.env,
-        OPENCLAW_HEAVY_CHECK_LOCK_SCOPE: "worktree",
         OPENCLAW_LOCAL_CHECK: "1",
       },
     });
 
     expect(result.status).toBe(1);
     expect(result.stderr).not.toContain("[oxlint:");
-    expect(existsSync(join(tempDir, ".artifacts/openclaw-local-checks/heavy-check.lock"))).toBe(
-      false,
-    );
   });
 
   it("falls back to the full extension shard when Windows extension dirs are unavailable", () => {

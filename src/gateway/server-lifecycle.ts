@@ -24,9 +24,15 @@ import { createGatewayCronReconciliation } from "./server-cron-reconciled.js";
 import { applyGatewayLaneConcurrency, resolveGatewayLaneConcurrency } from "./server-lanes.js";
 import { createGatewayServerLiveState } from "./server-live-state.js";
 import type { GatewayRequestContext } from "./server-methods/types.js";
+import {
+  createGatewayPluginRuntimeGeneration,
+  type GatewayPluginRuntimeClaim,
+} from "./server-plugin-runtime-generation.js";
 import type { GatewayCloseOptions } from "./server-public.js";
 import type { prepareGatewayKernelState } from "./server-runtime-state-prepare.js";
+import { runGatewayShutdownSteps } from "./server-shutdown.js";
 import type { GatewayShutdownRuntime } from "./server-shutdown.runtime.js";
+import { createGatewaySidecarStopOwner } from "./server-sidecar-owners.js";
 import {
   getHealthVersion,
   incrementPresenceVersion,
@@ -49,9 +55,9 @@ export async function prepareGatewayLifecycle(params: {
   const { runtime, port, log, logCron, diagnosticsEnabled, shutdownRuntime } = params;
   const {
     minimalTestGateway,
-    workerGatewayEndpoint,
     transportBridge,
     sessionMessageSubscribers,
+    isConnectionActive,
     clients,
     broadcast,
     cfgAtStart,
@@ -79,13 +85,14 @@ export async function prepareGatewayLifecycle(params: {
     watchNodeRequestHandler,
     defaultWorkspaceDir,
     activeTaskCount,
-    residentRegistry,
     desktopSessionRegistry,
     nodeDesktopStreamBroker,
+    nodeDesktopObserveAvailable,
     bindDeviceNodeControl,
+    bindWorkerNodeDesktopControl,
     workerPlacementRuntime,
+    lifecycle,
   } = runtime;
-  workerGatewayEndpoint.resolve = transportBridge.getWorkerIngressEndpoint;
   const subscribeSessionMessageEvents: GatewayRequestContext["subscribeSessionMessageEvents"] = (
     connId,
     sessionKey,
@@ -117,8 +124,13 @@ export async function prepareGatewayLifecycle(params: {
     listRegisteredNodePluginToolCommands: () => pluginRuntime.registry.nodeHostCommands,
     nodePluginToolsEnabled: cfgAtStart.gateway?.nodes?.pluginTools?.enabled !== false,
     nodeSkillsEnabled: cfgAtStart.gateway?.nodes?.allowSkills !== false,
-    onRunnerInventoryChanged: (nodeId) => {
-      void workerPlacementRuntime?.scheduleNodeWorkspaceRetention(nodeId);
+    onRunnerStateChanged: (nodeId, change) => {
+      if (change.availabilityChanged) {
+        workerPlacementRuntime?.runnerAvailability.markChanged();
+      }
+      if (change.inventoryChanged) {
+        void workerPlacementRuntime?.scheduleNodeWorkspaceRetention(nodeId);
+      }
     },
     onPairingInvalidated: ({ nodeId, connId }) => {
       void nodeDesktopServiceRef.current?.stopNode(nodeId);
@@ -131,7 +143,7 @@ export async function prepareGatewayLifecycle(params: {
     },
   });
   const nodeDesktopService =
-    desktopSessionRegistry && nodeDesktopStreamBroker
+    nodeDesktopObserveAvailable && desktopSessionRegistry && nodeDesktopStreamBroker
       ? (await import("./desktop/node-source.js")).createNodeDesktopService({
           getConfig: getRuntimeConfig,
           nodeRegistry,
@@ -141,6 +153,7 @@ export async function prepareGatewayLifecycle(params: {
       : undefined;
   nodeDesktopServiceRef.current = nodeDesktopService;
   bindDeviceNodeControl?.(nodeWorkerSupervisorTransport);
+  bindWorkerNodeDesktopControl?.(nodeWorkerSupervisorTransport);
   const { createWatchNodeHttpRuntime } = await import("./watch-node-http.js");
   const watchNodeHttpRuntime = createWatchNodeHttpRuntime({
     nodeRegistry,
@@ -203,16 +216,24 @@ export async function prepareGatewayLifecycle(params: {
       cfg: cfgAtStart,
       deps,
       broadcast,
+      resolveGatewayContext: runtime.resolvePluginGatewayContext,
     }),
     gatewayMethods: listActiveGatewayMethods(pluginRuntime.baseGatewayMethods),
   });
   const runtimeState = runtimeStateRef.current;
+  const pluginRuntimeGeneration = createGatewayPluginRuntimeGeneration({
+    getServices: () => runtimeState.pluginServices,
+    setServices: (services) => {
+      runtimeState.pluginServices = services;
+    },
+  });
   const unavailableGatewayMethods = new Set<string>(
     minimalTestGateway ? [] : STARTUP_UNAVAILABLE_GATEWAY_METHODS,
   );
   // Kernel methods are the only writers for readiness and advertised-method state.
   // Residents use this surface so later ownership splits cannot mutate shared state directly.
   const kernel = {
+    pluginRuntimeGeneration,
     setDispatchReady: (ready: boolean) => {
       startupState.dispatchReady = ready;
     },
@@ -228,11 +249,9 @@ export async function prepareGatewayLifecycle(params: {
       runtimeState.gatewayMethods.splice(0, runtimeState.gatewayMethods.length, ...methods);
     },
     setEarlyRuntimeHandles: (handles: {
-      bonjourStop: typeof runtimeState.bonjourStop;
       getActiveTaskCount: () => number;
       skillsChangeUnsub: typeof runtimeState.skillsChangeUnsub;
     }) => {
-      runtimeState.bonjourStop = handles.bonjourStop;
       activeTaskCount.get = handles.getActiveTaskCount;
       runtimeState.skillsChangeUnsub = handles.skillsChangeUnsub;
     },
@@ -248,17 +267,18 @@ export async function prepareGatewayLifecycle(params: {
       runtimeState.heartbeatRunner = handles.heartbeatRunner;
       runtimeState.stopOutboundDeliveryRecovery = handles.stopOutboundDeliveryRecovery;
     },
-    setPostAttachHandles: (handles: {
-      stopGatewayUpdateCheck: typeof runtimeState.stopGatewayUpdateCheck;
-      tailscaleCleanup: typeof runtimeState.tailscaleCleanup;
-      pluginServices: typeof runtimeState.pluginServices;
-    }) => {
+    setPostAttachHandles: (
+      handles: {
+        stopGatewayUpdateCheck: typeof runtimeState.stopGatewayUpdateCheck;
+        pluginServices: typeof runtimeState.pluginServices;
+      },
+      claim: GatewayPluginRuntimeClaim,
+    ) => {
       runtimeState.stopGatewayUpdateCheck = handles.stopGatewayUpdateCheck;
-      runtimeState.tailscaleCleanup = handles.tailscaleCleanup;
-      runtimeState.pluginServices = handles.pluginServices;
+      pluginRuntimeGeneration.publishServices(claim, handles.pluginServices);
     },
-    setPluginServices: (pluginServices: typeof runtimeState.pluginServices) => {
-      runtimeState.pluginServices = pluginServices;
+    setTailscaleCleanup: (cleanup: typeof runtimeState.tailscaleCleanup) => {
+      runtimeState.tailscaleCleanup = cleanup;
     },
     setConfigReloaderHandle: (configReloader: typeof runtimeState.configReloader) => {
       runtimeState.configReloader = configReloader;
@@ -304,36 +324,20 @@ export async function prepareGatewayLifecycle(params: {
     addGatewayLifetimeSidecar: (sidecar: (typeof runtimeState.gatewayLifetimeSidecars)[number]) => {
       runtimeState.gatewayLifetimeSidecars.push(sidecar);
     },
-    setMaintenanceHandles: (handles: {
-      tickInterval: typeof runtimeState.tickInterval;
-      healthInterval: typeof runtimeState.healthInterval;
-      dedupeCleanup: typeof runtimeState.dedupeCleanup;
-      stopMediaCleanup: typeof runtimeState.stopMediaCleanup;
-      worktreeCleanup: typeof runtimeState.worktreeCleanup;
-      skillCuratorCleanup: typeof runtimeState.skillCuratorCleanup;
-    }) => {
-      runtimeState.tickInterval = handles.tickInterval;
-      runtimeState.healthInterval = handles.healthInterval;
-      runtimeState.dedupeCleanup = handles.dedupeCleanup;
+    setMaintenanceHandles: (handles: NonNullable<typeof runtimeState.maintenance>) => {
+      runtimeState.maintenance = handles;
       runtimeState.stopMediaCleanup = handles.stopMediaCleanup;
-      runtimeState.worktreeCleanup = handles.worktreeCleanup;
-      runtimeState.skillCuratorCleanup = handles.skillCuratorCleanup;
     },
   };
   runtimeState.controlUiSessionPullRequests = createControlUiSessionPullRequestSubscriptions({
     broadcastToConnIds,
+    isConnectionActive,
   });
   runtimeState.sessionViewerPresence = createSessionViewerPresenceDeclarations({
-    onReplace: (connId, sessionKeys) => {
-      const client = [...clients].find((candidate) => candidate.connId === connId);
-      if (!client?.presenceKey) {
-        return;
-      }
-      upsertPresence(client.presenceKey, {
-        watchedSessions: sessionKeys.length > 0 ? [...sessionKeys] : undefined,
-      });
-      broadcastPresenceSnapshot({ broadcast, incrementPresenceVersion, getHealthVersion });
-    },
+    clients,
+    broadcast,
+    incrementPresenceVersion,
+    getHealthVersion,
   });
   deps.cron = runtimeState.cronState.cron;
   const pluginHostServices = {
@@ -342,7 +346,6 @@ export async function prepareGatewayLifecycle(params: {
     },
   };
 
-  const lifecycle = { closePreludeStarted: false };
   const cronReconciliation = createGatewayCronReconciliation({
     port,
     workspaceDir: defaultWorkspaceDir,
@@ -383,7 +386,12 @@ export async function prepareGatewayLifecycle(params: {
     return mediaCleanupStopPromise;
   };
   const markClosePreludeStarted = () => {
+    if (lifecycle.closePreludeStarted) {
+      return;
+    }
     lifecycle.closePreludeStarted = true;
+    postReadySidecarStopOwner.beginClose();
+    gatewayLifetimeSidecarStopOwner.beginClose();
     // Fence background owners before any awaited close step can tear down the
     // plugin/channel or shared-state runtime they still need.
     void stopOutboundDeliveryRecoveryForClose();
@@ -454,44 +462,52 @@ export async function prepareGatewayLifecycle(params: {
       getEventLoopHealth: readinessEventLoopHealth.snapshot,
       getConfigReloaderHotReloadStatus: kernel.getConfigReloaderHotReloadStatus,
     });
-  const stopRegisteredPostReadySidecars = async () => {
-    const postReadySidecars = runtimeState.postReadySidecars;
-    runtimeState.postReadySidecars = [];
-    for (const postReadySidecar of postReadySidecars) {
-      await postReadySidecar.stop();
-    }
-  };
-  const stopRegisteredGatewayLifetimeSidecars = async () => {
-    const gatewayLifetimeSidecars = runtimeState.gatewayLifetimeSidecars;
-    runtimeState.gatewayLifetimeSidecars = [];
-    for (const gatewayLifetimeSidecar of gatewayLifetimeSidecars) {
-      await gatewayLifetimeSidecar.stop();
+  const postReadySidecarStopOwner = createGatewaySidecarStopOwner({
+    getRegistered: () => runtimeState.postReadySidecars,
+    setRegistered: (sidecars) => {
+      runtimeState.postReadySidecars = sidecars;
+    },
+  });
+  const gatewayLifetimeSidecarStopOwner = createGatewaySidecarStopOwner({
+    getRegistered: () => runtimeState.gatewayLifetimeSidecars,
+    setRegistered: (sidecars) => {
+      runtimeState.gatewayLifetimeSidecars = sidecars;
+    },
+  });
+  const stopRegisteredPostReadySidecars = postReadySidecarStopOwner.stop;
+  const stopRegisteredGatewayLifetimeSidecars = gatewayLifetimeSidecarStopOwner.stop;
+  const sealAndJoinRegisteredSidecarStops = async () => {
+    const results = await Promise.allSettled([
+      postReadySidecarStopOwner.sealAndJoin(),
+      gatewayLifetimeSidecarStopOwner.sealAndJoin(),
+    ]);
+    const failure = results.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    if (failure) {
+      throw failure.reason;
     }
   };
   const createCloseHandler = () => async (optsValue?: GatewayCloseOptions) => {
+    markClosePreludeStarted();
     const channelIds = listLoadedChannelPlugins().map((plugin) => plugin.id as ChannelId);
     const transport = transportBridge.current();
     await transport?.portalService.closeAll();
     await shutdownRuntime.createGatewayCloseHandler({
-      bonjourStop: runtimeState.bonjourStop,
+      bonjourStop: kernel.swapBonjourStop(null),
       tailscaleCleanup: runtimeState.tailscaleCleanup,
       clearSecretsRuntimeSnapshot: clearSecretsRuntimeSnapshotState,
       channelIds,
       stopChannel,
       pluginServices: runtimeState.pluginServices,
-      postReadySidecars: runtimeState.postReadySidecars,
       cron: runtimeState.cronState.cron,
       heartbeatRunner: runtimeState.heartbeatRunner,
       updateCheckStop: runtimeState.stopGatewayUpdateCheck,
       stopTaskRegistryMaintenance: shutdownRuntime.stopTaskRegistryMaintenance,
       nodePresenceTimers,
       broadcast,
-      tickInterval: runtimeState.tickInterval,
-      healthInterval: runtimeState.healthInterval,
-      dedupeCleanup: runtimeState.dedupeCleanup,
+      maintenance: runtimeState.maintenance,
       stopMediaCleanup: stopMediaCleanupForClose,
-      worktreeCleanup: runtimeState.worktreeCleanup,
-      skillCuratorCleanup: runtimeState.skillCuratorCleanup,
       agentUnsub: runtimeState.agentUnsub,
       heartbeatUnsub: runtimeState.heartbeatUnsub,
       transcriptUnsub: runtimeState.transcriptUnsub,
@@ -505,23 +521,10 @@ export async function prepareGatewayLifecycle(params: {
       agentRunSeq,
       nodeSendToSession,
       resolveActiveSessionIdForKey: resolveActiveEmbeddedRunSessionId,
-      markMainSessionsAbortedForRestart: async ({
-        sessionKeys,
-        sessionIds,
-        activeRuns,
-        reason,
-        isActiveRun,
-      }) => {
-        if (sessionKeys.size === 0 && sessionIds.size === 0) {
-          return;
-        }
+      markMainSessionsAbortedForRestart: async (restart) => {
         await shutdownRuntime.markRestartAbortedMainSessions({
           cfg: getRuntimeConfig(),
-          sessionKeys,
-          sessionIds,
-          activeRuns,
-          isActiveRun,
-          reason,
+          ...restart,
         });
       },
       getPendingReplyCount: getTotalPendingReplies,
@@ -542,48 +545,45 @@ export async function prepareGatewayLifecycle(params: {
       closeProviderTransportDispatcherPool: shutdownRuntime.closeProviderTransportDispatcherPool,
     })(optsValue);
   };
-  let clearFallbackGatewayContextForServer = () => {};
   const closeOnStartupFailure = async () => {
-    try {
-      await beginClosePrelude();
-      await stopRegisteredGatewayLifetimeSidecars();
-      await stopRegisteredPostReadySidecars();
-      await runClosePrelude();
-      await createCloseHandler()({ reason: "gateway startup failed" });
-    } finally {
-      clearFallbackGatewayContextForServer();
-    }
+    await runGatewayShutdownSteps({
+      steps: [
+        { name: "close prelude fence", run: beginClosePrelude },
+        { name: "gateway lifetime sidecars", run: stopRegisteredGatewayLifetimeSidecars },
+        { name: "post-ready sidecars", run: stopRegisteredPostReadySidecars },
+        { name: "gateway close prelude", run: runClosePrelude },
+        { name: "late sidecar cleanup", run: sealAndJoinRegisteredSidecarStops },
+        {
+          name: "gateway close",
+          run: () => createCloseHandler()({ reason: "gateway startup failed" }),
+        },
+      ],
+      onError: (message) => log.error(message),
+    });
   };
 
-  const diagnosticHeartbeatResident = residentRegistry.register({
-    name: "diagnostic-heartbeat",
-    start: () => {
-      // Gateway lifecycle owns both this existing heartbeat timer and the monitor
-      // it samples, so startup failure and normal close tear them down together.
-      startDiagnosticHeartbeat(undefined, {
-        getConfig: getRuntimeConfig,
-        startupGraceMs: 60_000,
-        sampleLiveness: () => {
-          const sample = readinessEventLoopHealth.persistentDegradationSnapshot();
-          if (!sample || sample.degradedSinceMs == null) {
-            return null;
-          }
-          return {
-            reasons: sample.reasons,
-            intervalMs: sample.intervalMs,
-            degradedSinceMs: sample.degradedSinceMs,
-            eventLoopDelayP99Ms: sample.delayP99Ms,
-            eventLoopDelayMaxMs: sample.delayMaxMs,
-            eventLoopUtilization: sample.utilization,
-            cpuCoreRatio: sample.cpuCoreRatio,
-          };
-        },
-      });
-    },
-    stop: () => stopDiagnosticHeartbeat(),
-  });
   if (diagnosticsEnabled) {
-    diagnosticHeartbeatResident.start();
+    // Gateway lifecycle owns both this existing heartbeat timer and the monitor
+    // it samples, so startup failure and normal close tear them down together.
+    startDiagnosticHeartbeat(undefined, {
+      getConfig: getRuntimeConfig,
+      startupGraceMs: 60_000,
+      sampleLiveness: () => {
+        const sample = readinessEventLoopHealth.persistentDegradationSnapshot();
+        if (!sample || sample.degradedSinceMs == null) {
+          return null;
+        }
+        return {
+          reasons: sample.reasons,
+          intervalMs: sample.intervalMs,
+          degradedSinceMs: sample.degradedSinceMs,
+          eventLoopDelayP99Ms: sample.delayP99Ms,
+          eventLoopDelayMaxMs: sample.delayMaxMs,
+          eventLoopUtilization: sample.utilization,
+          cpuCoreRatio: sample.cpuCoreRatio,
+        };
+      },
+    });
   }
 
   return {
@@ -622,13 +622,10 @@ export async function prepareGatewayLifecycle(params: {
     refreshGatewayHealthSnapshotWithRuntime,
     stopRegisteredPostReadySidecars,
     stopRegisteredGatewayLifetimeSidecars,
+    registerPostReadySidecars: postReadySidecarStopOwner.publish,
+    registerGatewayLifetimeSidecars: gatewayLifetimeSidecarStopOwner.publish,
+    sealAndJoinRegisteredSidecarStops,
     createCloseHandler,
-    clearFallbackGatewayContextForServer: {
-      get: () => clearFallbackGatewayContextForServer,
-      set: (cleanup: () => void) => {
-        clearFallbackGatewayContextForServer = cleanup;
-      },
-    },
     closeOnStartupFailure,
   };
 }

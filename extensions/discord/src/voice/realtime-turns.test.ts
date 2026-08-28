@@ -32,6 +32,45 @@ defineDiscordVoiceTests(
     expectUserMessageIncludes,
     expectUserMessageNotIncludes,
   }) => {
+    it.each(["before-final", "before-delivery"] as const)(
+      "keeps realtime transcript output with its retired audio binding %s",
+      async (ordering) => {
+        const manager = createAgentProxyManager(undefined, {
+          voice: { realtime: { requireWakeName: true } },
+        });
+        await manager.join({ guildId: "g1", channelId: "1001" });
+        const first = vi.fn();
+        const second = vi.fn();
+        await manager.join(
+          { guildId: "g1", channelId: "1001" },
+          { transcripts: { sessionId: "old", onUtterance: first } },
+        );
+        const entry = getSessionEntry(manager);
+        const bridge = lastRealtimeBridgeParams();
+        beginSpeakerTurn(entry);
+        if (ordering === "before-delivery") {
+          bridge?.onTranscript?.("user", "old room speech", true);
+        }
+        const replacing = manager.join(
+          { guildId: "g1", channelId: "1001" },
+          { transcripts: { sessionId: "new", onUtterance: second } },
+        );
+        await replacing;
+        if (ordering === "before-final") {
+          bridge?.onTranscript?.("user", "old room speech", true);
+        }
+        await Promise.resolve();
+        expect(first).not.toHaveBeenCalled();
+        expect(second).not.toHaveBeenCalled();
+        beginSpeakerTurn(entry);
+        await emitFinalRealtimeUserTranscript(bridge, "fresh room speech");
+        expect(second).toHaveBeenCalledWith(
+          expect.objectContaining({ sessionId: "new", text: "fresh room speech" }),
+        );
+        await manager.destroy();
+      },
+    );
+
     it("applies Discord realtime model and voice overrides during provider auto-selection", async () => {
       const manager = createManager(
         makeVoiceConfig(
@@ -61,6 +100,7 @@ defineDiscordVoiceTests(
         "provider resolve options",
       );
       expect(providerOptions.configuredProviderId).toBeUndefined();
+      expect(providerOptions.agentId).toBe("agent-1");
       expect(providerOptions.defaultModel).toBe("gpt-realtime-2");
       expect(requireRecord(providerOptions.providerConfigs, "provider configs").openai).toEqual({
         model: "provider-default",
@@ -71,6 +111,7 @@ defineDiscordVoiceTests(
         voice: "cedar",
         minBargeInAudioEndMs: 500,
       });
+      expect(lastRealtimeBridgeParams().agentId).toBe("agent-1");
     });
 
     it("keeps agent-proxy realtime transcripts on the audio turn speaker context", async () => {
@@ -138,6 +179,57 @@ defineDiscordVoiceTests(
       bridgeParams?.audioSink?.sendAudio(Buffer.alloc(24_000));
       bridgeParams?.onTranscript?.("assistant", "Cancelled the active OpenClaw run.", true);
       expect(player.stop).toHaveBeenCalledTimes(stopCallsAfterControl + 1);
+    });
+
+    it("keeps concurrent final transcripts bound to their original speakers", async () => {
+      let resolveGuestControl: ((result: RealtimeVoiceAgentControlResult) => void) | undefined;
+      controlRealtimeVoiceAgentRunMock.mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveGuestControl = resolve;
+        }),
+      );
+      agentCommandMock.mockResolvedValue({ payloads: [{ text: "talkback answer" }] });
+      const { bridgeParams, entry } = await createJoinedAgentProxyFixture({
+        config: {
+          voice: { realtime: { debounceMs: 1, requireWakeName: false, toolPolicy: "none" } },
+        },
+      });
+
+      beginSpeakerTurn(entry, {
+        senderIsOwner: false,
+        speakerLabel: "Alice",
+        userId: "u-alice",
+      });
+      bridgeParams?.onTranscript?.("user", "OpenClaw, cancel that", true);
+      await vi.waitFor(() => expect(controlRealtimeVoiceAgentRunMock).toHaveBeenCalledTimes(1));
+
+      beginSpeakerTurn(entry, {
+        senderIsOwner: true,
+        speakerLabel: "Bob",
+        userId: "u-bob",
+      });
+      bridgeParams?.onTranscript?.("user", "OpenClaw, stop that", true);
+      await vi.waitFor(() => expect(agentCommandMock).toHaveBeenCalledTimes(1));
+
+      resolveGuestControl?.({
+        ok: false,
+        mode: "cancel",
+        sessionKey: "discord:g1:c1",
+        active: false,
+        queued: false,
+        reason: "no_active_run",
+        message: "There is no active OpenClaw run to cancel.",
+        speak: true,
+        show: true,
+        suppress: false,
+      });
+      await vi.waitFor(() => expect(agentCommandMock).toHaveBeenCalledTimes(2));
+
+      const commandCalls = [agentCommandArgsAt(0), agentCommandArgsAt(1)];
+      const aliceCall = commandCalls.find((args) => String(args.message).includes("cancel that"));
+      const bobCall = commandCalls.find((args) => String(args.message).includes("stop that"));
+      expect(aliceCall?.senderIsOwner).toBe(false);
+      expect(bobCall?.senderIsOwner).toBe(true);
     });
 
     it("drops stale active-run control after provider continuity reset", async () => {

@@ -7,6 +7,10 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { migratePersistedImplicitMainRoster } from "../config/legacy.roster.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { writeChannelPairingStateSnapshot } from "../pairing/pairing-store-sqlite.test-helpers.js";
+import {
+  buildPluginCapabilityConsentReview,
+  type PluginCapabilityConsentHandler,
+} from "../plugins/capability-consent.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { loadAndMaybeMigrateDoctorConfig } from "./doctor-config-flow.js";
@@ -14,6 +18,7 @@ import {
   getDoctorConfigInputForTest,
   runDoctorConfigWithInput,
 } from "./doctor-config-flow.test-utils.js";
+import { createDoctorPrompter } from "./doctor-prompter.js";
 
 type TerminalNote = (message: string, title?: string) => void;
 
@@ -23,6 +28,13 @@ const runDoctorRepairSequenceMock = vi.hoisted(() => vi.fn());
 const createDoctorPluginMetadataSnapshotScopeParamsMock = vi.hoisted(() => vi.fn());
 const runDoctorConfigPreflightOptionsMock = vi.hoisted(() => vi.fn());
 const collectDoctorPreviewNotesParamsMock = vi.hoisted(() => vi.fn());
+const prepareTailscaleConfigMigrationMock = vi.hoisted(() =>
+  vi.fn(({ cfg }: { cfg: OpenClawConfig }) => ({
+    config: cfg,
+    changes: [] as string[],
+    warnings: [] as string[],
+  })),
+);
 const collectImplicitFallbackClobberWarningsMock = vi.hoisted(() =>
   vi.fn<(cfg: unknown) => string[]>(() => []),
 );
@@ -263,6 +275,10 @@ vi.mock("../../packages/terminal-core/src/note.js", () => ({
 
 vi.mock("../gateway/call.js", () => ({
   callGateway: (opts: unknown) => callGatewayMock(opts),
+}));
+
+vi.mock("./doctor-tailscale.js", () => ({
+  prepareTailscaleConfigMigration: prepareTailscaleConfigMigrationMock,
 }));
 
 vi.mock("./doctor/repair-sequencing.js", async () => {
@@ -992,21 +1008,23 @@ vi.mock("../plugins/doctor-contract-registry.js", async () => {
     return changes.length > 0 ? { config: next, changes } : { config: cfg, changes: [] };
   }
 
+  const collectRelevantDoctorPluginIds = (raw: unknown): string[] => {
+    const ids = new Set<string>();
+    const root = readNullableRecord(raw);
+    const channels = readNullableRecord(root?.channels);
+    for (const channelId of Object.keys(channels ?? {})) {
+      if (channelId !== "defaults") {
+        ids.add(channelId);
+      }
+    }
+    if (hasLegacyTalkFields(root?.talk)) {
+      ids.add("elevenlabs");
+    }
+    return [...ids].toSorted();
+  };
   return {
-    collectRelevantDoctorPluginIds: (raw: unknown): string[] => {
-      const ids = new Set<string>();
-      const root = readNullableRecord(raw);
-      const channels = readNullableRecord(root?.channels);
-      for (const channelId of Object.keys(channels ?? {})) {
-        if (channelId !== "defaults") {
-          ids.add(channelId);
-        }
-      }
-      if (hasLegacyTalkFields(root?.talk)) {
-        ids.add("elevenlabs");
-      }
-      return [...ids].toSorted();
-    },
+    collectRelevantDoctorPluginIds,
+    collectDoctorConfigRepairPluginIds: collectRelevantDoctorPluginIds,
     applyPluginDoctorCompatibilityMigrations: normalizeDiscordStreamingAliasesForTest,
     listPluginDoctorLegacyConfigRules: () => [
       {
@@ -1488,7 +1506,8 @@ vi.mock("./doctor-config-preflight.js", async () => {
           agentRosterIncludeOwned: injected?.agentRosterIncludeOwned === true,
           sourceConfigBeforeMigrations,
           config: effectiveConfig,
-          sourceConfig: effectiveConfig,
+          // The reader resolves source values but leaves legacy repairs to doctor.
+          sourceConfig: injectedEffectiveConfig,
           valid: legacyIssues.length === 0,
           warnings: [],
           legacyIssues,
@@ -1648,6 +1667,12 @@ describe("doctor config flow", () => {
     runDoctorRepairSequenceMock.mockReset();
     createDoctorPluginMetadataSnapshotScopeParamsMock.mockClear();
     collectDoctorPreviewNotesParamsMock.mockClear();
+    prepareTailscaleConfigMigrationMock.mockClear();
+    prepareTailscaleConfigMigrationMock.mockImplementation(({ cfg }) => ({
+      config: cfg,
+      changes: [],
+      warnings: [],
+    }));
     collectImplicitFallbackClobberWarningsMock.mockClear();
     collectImplicitFallbackClobberWarningsMock.mockReturnValue([]);
     noteImplicitFallbackClobberWarningsMock.mockClear();
@@ -1666,6 +1691,45 @@ describe("doctor config flow", () => {
     expect((result.cfg as Record<string, unknown>).gateway).toEqual({
       auth: { mode: "token", token: 123 },
     });
+  });
+
+  it("previews and applies the legacy Tailscale Serve migration through Doctor", async () => {
+    const config: OpenClawConfig = {
+      gateway: {
+        bind: "lan",
+        auth: { mode: "token", token: "secret" },
+        tailscale: { mode: "off" },
+      },
+    };
+    prepareTailscaleConfigMigrationMock.mockImplementation(({ cfg }) => ({
+      config: {
+        ...cfg,
+        gateway: {
+          ...cfg.gateway,
+          bind: "loopback" as const,
+          tailscale: { ...cfg.gateway?.tailscale, mode: "serve" as const },
+        },
+      },
+      changes: ["Migrated legacy Tailscale Serve to managed ingress."],
+      warnings: [],
+    }));
+
+    const preview = await runDoctorConfigWithInput({
+      config,
+      run: loadAndMaybeMigrateDoctorConfig,
+    });
+    const repair = await runDoctorConfigWithInput({
+      config,
+      repair: true,
+      run: loadAndMaybeMigrateDoctorConfig,
+    });
+
+    expect(preview.shouldWriteConfig).toBe(false);
+    expect(preview.cfg.gateway?.bind).toBe("lan");
+    expect(repair.shouldWriteConfig).toBe(true);
+    expect(repair.cfg.gateway?.bind).toBe("loopback");
+    expect(repair.cfg.gateway?.tailscale?.mode).toBe("serve");
+    expect(prepareTailscaleConfigMigrationMock).toHaveBeenCalledTimes(2);
   });
 
   it("plans persistence of the injected main roster during doctor repair", async () => {
@@ -1800,6 +1864,33 @@ describe("doctor config flow", () => {
     expect(result.cfg.agents?.ownership).toBe("explicit");
     expect(result.cfg.agents?.entries?.ops).not.toHaveProperty("default");
     expect(result.cfg.agents).not.toHaveProperty("list");
+  });
+
+  it("stamps explicit ownership when Doctor migrates a markerless multi-agent list", async () => {
+    const rawConfig = {
+      agents: {
+        list: [{ id: "ops" }, { id: "research", model: "openai/research" }],
+      },
+    };
+    const result = await runDoctorConfigWithInput({
+      config: migratePersistedImplicitMainRoster(rawConfig).config as OpenClawConfig,
+      parsedConfig: rawConfig,
+      repair: true,
+      run: loadAndMaybeMigrateDoctorConfig,
+    });
+
+    expect(result.shouldWriteConfig).toBe(true);
+    expect(result.explicitSetPaths).toEqual([
+      ["agents", "entries"],
+      ["agents", "ownership"],
+    ]);
+    expect(result.cfg.agents).toEqual({
+      ownership: "explicit",
+      entries: {
+        ops: {},
+        research: { model: "openai/research" },
+      },
+    });
   });
 
   it("materializes ambient roles for a multi-agent configured default", async () => {
@@ -2079,6 +2170,49 @@ describe("doctor config flow", () => {
     expect(scopeParams.getBaseSnapshot()?.index.installRecords).not.toHaveProperty("google-meet");
     result.invalidatePluginMetadataSnapshot();
     expect(scopeParams.getBaseSnapshot()).toBeUndefined();
+  });
+
+  it("does not treat noninteractive doctor fix as plugin capability consent", async () => {
+    const review = buildPluginCapabilityConsentReview({
+      pluginId: "demo",
+      manifest: { name: "Demo", contracts: { tools: ["demo.write"] } },
+      record: { source: "npm", spec: "@example/demo" },
+      config: {},
+    });
+    let acknowledgment: unknown = "not reviewed";
+    runDoctorRepairSequenceMock.mockImplementation(
+      async (params: { state: unknown; onCapabilityConsent?: PluginCapabilityConsentHandler }) => {
+        acknowledgment = await expectDefined(
+          params.onCapabilityConsent,
+          "doctor capability handler",
+        )(review);
+        return {
+          state: params.state,
+          changeNotes: [],
+          warningNotes: [],
+          authProfilesRepaired: false,
+        };
+      },
+    );
+    const prompter = createDoctorPrompter({
+      runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
+      options: { repair: true, yes: true, nonInteractive: true },
+    });
+    const confirm = vi.spyOn(prompter, "confirmRuntimeRepair");
+    await runDoctorConfigWithInput({
+      config: {},
+      repair: true,
+      run: (params) => loadAndMaybeMigrateDoctorConfig({ ...params, prompter }),
+    });
+
+    expect(acknowledgment).toBeUndefined();
+    expect(confirm).toHaveBeenCalledWith(
+      expect.objectContaining({ requiresInteractiveConfirmation: true, initialValue: false }),
+    );
+    expect(terminalNoteMock).toHaveBeenCalledWith(
+      expect.stringContaining("demo.write"),
+      "Plugin capabilities",
+    );
   });
 
   it("collects plugin blocker previews from the pre-auto-enable config", async () => {

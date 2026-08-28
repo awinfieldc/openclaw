@@ -20,7 +20,6 @@ import {
   type AcpRuntimeHandle,
   type AcpRuntimeOptions,
   type AcpRuntimeStatus,
-  type AcpRuntimeTurn,
   type AcpRuntimeTurnResult,
   type SessionAgentOptions,
 } from "acpx/runtime";
@@ -47,7 +46,7 @@ import {
   isOpenClawLeaseAwareAcpxProcessCommand,
   type AcpxProcessCleanupDeps,
 } from "./process-reaper.js";
-import type { CompleteAcpRuntime } from "./runtime-proxy.js";
+import type { CompleteAcpRuntime, CompleteAcpRuntimeTurn } from "./runtime-proxy.js";
 
 type AcpSessionStore = AcpRuntimeOptions["sessionStore"];
 type AcpSessionRecord = Parameters<AcpSessionStore["save"]>[0];
@@ -1622,7 +1621,7 @@ export class AcpxRuntime implements CompleteAcpRuntime {
     }
   }
 
-  startTurn(input: OpenClawRuntimeTurnInput): AcpRuntimeTurn {
+  startTurn(input: OpenClawRuntimeTurnInput): CompleteAcpRuntimeTurn {
     const readCodexTurnFailureStderr = () =>
       this.readCodexTurnFailureStderr({
         handle: input.handle,
@@ -1657,6 +1656,9 @@ export class AcpxRuntime implements CompleteAcpRuntime {
 
     return {
       requestId: input.requestId,
+      get promptStarted() {
+        return turnPromise.then(({ turn }) => turn.promptStarted);
+      },
       events: {
         async *[Symbol.asyncIterator](): AsyncIterator<AcpRuntimeEvent> {
           const { command, turn } = await turnPromise;
@@ -1807,7 +1809,11 @@ export class AcpxRuntime implements CompleteAcpRuntime {
         const reasoningEffort =
           classification.kind === "override" ? classification.override.reasoningEffort : undefined;
         if (!reasoningEffort) {
-          return;
+          // `off` omits the startup override; Codex has no live control to unset effort.
+          throw new AcpRuntimeError(
+            "ACP_BACKEND_UNSUPPORTED_CONTROL",
+            "Clearing Codex reasoning effort on an existing session is unsupported. Choose a supported explicit effort; the current effort is unchanged.",
+          );
         }
         await delegate.setConfigOption({
           ...input,

@@ -2,7 +2,6 @@ import crypto from "node:crypto";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { hasConfiguredModelFallbacks } from "../../agents/agent-scope.js";
 import { resolveModelAuthMode } from "../../agents/model-auth.js";
-import { isCliProvider } from "../../agents/model-selection.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import { updateSessionEntry } from "../../config/sessions/session-accessor.js";
 import { enqueueSystemEvent } from "../../infra/system-events.js";
@@ -26,10 +25,8 @@ import {
   derivePromptSegments,
   type TraceCompletionView,
   type TraceContextManagementView,
-  type TraceExecutionView,
   type TracePromptSegmentView,
   type TraceToolSummaryView,
-  mergeExecutionTrace,
 } from "./agent-runner-trace.js";
 import { appendUsageLine } from "./agent-runner-usage-line.js";
 import {
@@ -83,8 +80,6 @@ export async function completeReplyAgentRun(input: {
   const {
     autoCompactionCount,
     contextTokensUsed,
-    fallbackAttempts,
-    fallbackExhausted,
     modelUsed,
     promptTokens,
     providerUsed,
@@ -132,18 +127,13 @@ export async function completeReplyAgentRun(input: {
 
     // Inject post-compaction workspace context for the next agent turn
     if (sessionKey) {
-      readPostCompactionContext(followupRun.run.workspaceDir, {
+      const contextContent = await readPostCompactionContext(followupRun.run.workspaceDir, {
         cfg,
         agentId: followupRun.run.agentId,
-      })
-        .then((contextContent) => {
-          if (contextContent) {
-            enqueueSystemEvent(contextContent, { sessionKey });
-          }
-        })
-        .catch(() => {
-          // Silent failure — post-compaction context is best-effort
-        });
+      });
+      if (contextContent) {
+        enqueueSystemEvent(contextContent, { sessionKey });
+      }
     }
 
     if (verboseEnabled) {
@@ -163,14 +153,7 @@ export async function completeReplyAgentRun(input: {
     ? undefined
     : (runResult.meta?.finalAssistantRawText ?? runResult.meta?.finalAssistantVisibleText);
   const traceAuthorized = followupRun.run.traceAuthorized === true;
-  const executionTrace = mergeExecutionTrace({
-    fallbackAttempts,
-    executionTrace: runResult.meta?.executionTrace as TraceExecutionView | undefined,
-    provider: providerUsed,
-    model: modelUsed,
-    runner: isCliProvider(providerUsed, cfg) ? "cli" : "embedded",
-    exhausted: fallbackExhausted,
-  });
+  const executionTrace = runResult.meta?.executionTrace;
   const requestShaping = {
     authMode:
       runResult.meta?.requestShaping?.authMode ??

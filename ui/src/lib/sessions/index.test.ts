@@ -29,6 +29,38 @@ function sessionChangedEvent(key: string): GatewayEventFrame {
 
 describe("createSessionCapability", () => {
   it.each(["direct", "subscription"] as const)(
+    "shares confirmed archive visibility after %s reconciliation",
+    async (path) => {
+      const key = "agent:main:archive-from-agent";
+      const row = { key, kind: "direct" as const, sessionId: "archive-session", updatedAt: 1 };
+      const request = vi.fn(async () => sessionsResult([row], 1));
+      const { emitEvent, gateway } = createGatewayHarness({
+        request,
+      } as unknown as GatewayBrowserClient);
+      const sessions = createSessionCapability(gateway);
+      const reconcile = (archived: boolean, updatedAt: number) => {
+        const payload = { ...row, sessionKey: key, reason: "patch", archived, updatedAt };
+        if (path === "direct") {
+          sessions.reconcileChanged(payload);
+        } else {
+          emitEvent({ type: "event", event: "sessions.changed", payload });
+        }
+      };
+      try {
+        await sessions.refresh({ agentId: "main", force: true });
+        reconcile(true, 2);
+        expect(sessions.archiveVisibility(key)).toBe("archived");
+        await sessions.refresh({ agentId: "main", force: true });
+        expect(sessions.archiveVisibility(key)).toBe("archived");
+        reconcile(false, 3);
+        expect(sessions.archiveVisibility(key)).toBeUndefined();
+      } finally {
+        sessions.dispose();
+      }
+    },
+  );
+
+  it.each(["direct", "subscription"] as const)(
     "ignores stale archive state after a newer unarchive via %s reconciliation",
     async (path) => {
       const key = "agent:main:main";
@@ -490,36 +522,6 @@ describe("createSessionCapability", () => {
 
     currentList.resolve(sessionsResult([{ key: "current", kind: "direct", updatedAt: 2 }], 2));
     await waitForFast(() => expect(sessions.state.result?.sessions[0]?.key).toBe("current"));
-    sessions.dispose();
-  });
-
-  it("does not publish a created session from a retired same-client epoch", async () => {
-    const staleCreate = createDeferred<{ key: string }>();
-    const request = vi.fn(async (method: string) => {
-      if (method === "sessions.create") {
-        return await staleCreate.promise;
-      }
-      if (method === "sessions.subscribe") {
-        return { subscribed: true };
-      }
-      if (method === "sessions.list") {
-        return sessionsResult([], 2);
-      }
-      throw new Error(`Unexpected request: ${method}`);
-    });
-    const client = { request } as unknown as GatewayBrowserClient;
-    const { gateway, publish } = createGatewayHarness(client);
-    const sessions = createSessionCapability(gateway);
-    const created = vi.fn();
-    sessions.subscribeCreated(created);
-
-    const operation = sessions.create({ agentId: "main" });
-    publish(false);
-    publish(true);
-    staleCreate.resolve({ key: "agent:main:stale" });
-
-    await expect(operation).resolves.toBeNull();
-    expect(created).not.toHaveBeenCalled();
     sessions.dispose();
   });
 

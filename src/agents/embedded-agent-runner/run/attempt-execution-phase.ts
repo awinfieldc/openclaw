@@ -3,11 +3,13 @@ import {
   bindOwnedSessionTranscriptWrites,
   withOwnedSessionTranscriptWrites,
 } from "../../../config/sessions/transcript-write-context.js";
+import { createDiagnosticEmbeddedRunOwner } from "../../../logging/diagnostic-run-activity.js";
 import {
   mergeAgentRunAttemptTerminal,
   projectAgentRunAttemptTerminal,
   type AgentRunAttemptTerminal,
 } from "../../agent-run-terminal-outcome.js";
+import { agentSessionSetContextReplacementHook } from "../../sessions/agent-session-compaction.js";
 import { log } from "../logger.js";
 import type { EmbeddedAgentQueueHandle } from "../runs.js";
 import { flushPendingToolResultsAfterIdle } from "../wait-for-idle-before-flush.js";
@@ -31,13 +33,14 @@ export async function runEmbeddedAttemptExecutionPhase(
       activeSession,
       allCustomTools,
       builtinToolNames,
+      coreBuiltinToolNames,
       clientToolCallSlots,
-      clientToolLoopDetection,
       hasDeliveredSourceReply,
       hookRunner,
       markSourceReplyDelivered,
       replaySafeToolNames,
       replaySafeTools,
+      codeModeExecToolNames,
       sideEffectToolOwners,
       setActiveSessionSystemPrompt,
       settingsManager,
@@ -56,8 +59,16 @@ export async function runEmbeddedAttemptExecutionPhase(
     toolCatalog.toolSearchRunPlan;
   const { runtimeChannel } = systemPrompt;
   const { toolSearchTargetTranscriptProjections } = toolBase;
+  activeSession[agentSessionSetContextReplacementHook](() =>
+    toolBase.skillInstructionDeliveryCache.clear(),
+  );
   const hookAgentId = input.setup.sessionAgentId;
   let repairedRejectedProviderReplay = false;
+  const diagnosticOwner = createDiagnosticEmbeddedRunOwner({
+    sessionId: attempt.sessionId,
+    sessionKey: attempt.sessionKey,
+    runId: attempt.runId,
+  });
   const mergeTerminal = (incoming: AgentRunAttemptTerminal) => {
     state.terminal = mergeAgentRunAttemptTerminal(state.terminal, incoming);
   };
@@ -75,7 +86,6 @@ export async function runEmbeddedAttemptExecutionPhase(
     isOpenAIResponsesApi,
     replayAllowedToolNames,
     liveAllowedToolNames,
-    clientToolLoopDetection,
     anthropicPayloadLogger,
     effectiveAgentTransport,
     providerTextTransforms,
@@ -86,6 +96,7 @@ export async function runEmbeddedAttemptExecutionPhase(
     },
     onIdleTimeout: (error) => idleTimeoutTriggerRef.current?.(error),
     abortSignal: input.runAbortController.signal,
+    diagnosticOwner,
   });
   input.setup.prepStages.mark("stream-setup");
   input.setup.emitPrepStageSummary("stream-ready");
@@ -136,7 +147,15 @@ export async function runEmbeddedAttemptExecutionPhase(
   });
   input.externalAbortController.setRunAbort(abortRun);
   idleTimeoutTriggerRef.current = (error) => {
-    mergeTerminal({ kind: "timeout", phase: "prompt", source: "idle" });
+    // Caller cancellation owns the terminal outcome when it beats a late watchdog callback.
+    if (input.runAbortController.signal.aborted) {
+      return;
+    }
+    mergeTerminal({
+      kind: "timeout",
+      phase: activeSession.isCompacting ? "compaction" : "prompt",
+      source: "idle",
+    });
     abortRun(true, error);
   };
   const abortable = <T>(promise: Promise<T>): Promise<T> =>
@@ -193,8 +212,11 @@ export async function runEmbeddedAttemptExecutionPhase(
     markSourceReplyDelivered,
     sandboxSessionKey: input.setup.sandboxSessionKey,
     builtinToolNames,
+    coreBuiltinToolNames,
     replaySafeToolNames,
+    codeModeExecToolNames,
     sideEffectToolOwners,
+    diagnosticOwner,
   });
   input.lifecycle.setToolSearchCatalogExecutor(preparedStream.toolSearchCatalogExecutor);
   input.externalAbortController.setCompactionState({

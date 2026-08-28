@@ -52,10 +52,7 @@ describe("worker turn launcher terminal results", () => {
           }),
         );
         createWorkerSessionPlacementGate(placements).updateAckCursors({
-          sessionId: SESSION_ID,
-          environmentId: ENVIRONMENT_ID,
-          ownerEpoch: OWNER_EPOCH,
-          runId: "run-reconcile-tunnel-loss",
+          claim: request.turnClaim,
           transcriptSeq: 2,
           liveSeq: 1,
         });
@@ -113,6 +110,7 @@ describe("worker turn launcher terminal results", () => {
         async () => ({ meta: { durationMs: 1 } }),
       ),
     ).rejects.toMatchObject({
+      name: "WorkerWorkspaceReconciliationError",
       message:
         "Cloud worker finished, but its workspace result could not be reconciled: workspace-transfer-failed: gateway TLS fingerprint mismatch",
     });
@@ -187,10 +185,7 @@ describe("worker turn launcher terminal results", () => {
             }),
           );
           createWorkerSessionPlacementGate(placements).updateAckCursors({
-            sessionId: SESSION_ID,
-            environmentId: ENVIRONMENT_ID,
-            ownerEpoch: OWNER_EPOCH,
-            runId: "run-worker-usage",
+            claim: request.turnClaim,
             transcriptSeq: 2,
             liveSeq: 1,
           });

@@ -1,8 +1,6 @@
 /** Handles inline slash commands, skill invocations, and abort actions before model runs. */
-import {
-  normalizeOptionalLowercaseString,
-  normalizeOptionalString,
-} from "@openclaw/normalization-core/string-coerce";
+import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+import type { QueueMode } from "../../../packages/gateway-protocol/src/schema/logs-chat.js";
 import { collectTextContentBlocks } from "../../agents/content-blocks.js";
 import type { BlockReplyChunking } from "../../agents/embedded-agent-block-chunker.js";
 import type { ExecPolicyOverrides } from "../../agents/exec-defaults.js";
@@ -14,10 +12,11 @@ import { formatErrorMessage } from "../../infra/errors.js";
 import { generateSecureToken } from "../../infra/secure-random.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import {
+  expandBundleCommandPromptTemplate,
+  expandExplicitSkillReferences,
   hasSkillReferenceCandidate,
   listReservedChatSlashCommandNames,
   resolveSkillCommandInvocation,
-  resolveSkillReferenceInvocations,
 } from "../../skills/discovery/chat-commands.js";
 import type { ExplicitSkillSelection, SkillCommandSpec } from "../../skills/types.js";
 import {
@@ -50,7 +49,7 @@ import type { InlineDirectives } from "./directive-handling.parse.js";
 import { extractExplicitGroupId } from "./group-id.js";
 import { stripMentions, stripStructuralPrefixes } from "./mentions.js";
 import type { createModelSelectionState } from "./model-selection.js";
-import { extractInlineSimpleCommand } from "./reply-inline.js";
+import { extractInlineSimpleCommand, getStandaloneSlashCommandName } from "./reply-inline.js";
 import type { TypingController } from "./typing.js";
 
 type SkillCommandsRuntime = typeof import("../../skills/discovery/chat-commands.runtime.js");
@@ -78,7 +77,6 @@ const commandsRuntimeLoader = createLazyImportLoader<CommandsRuntime>(
   () => import("./commands.runtime.js"),
 );
 let builtinSlashCommands: Set<string> | null = null;
-const MAX_EXPLICIT_SKILL_REFERENCES = 8;
 
 function loadSkillCommandsRuntime(): Promise<SkillCommandsRuntime> {
   return skillCommandsRuntimeLoader.load();
@@ -124,43 +122,6 @@ function resolveSlashCommandName(commandBodyNormalized: string): string | null {
   return name ? name : null;
 }
 
-function applyExplicitSkillReferences(
-  body: string,
-  skillCommands: SkillCommandSpec[],
-): { body: string; overflow: boolean; skills: SkillCommandSpec[] } {
-  const resolved = resolveSkillReferenceInvocations({ text: body, skillCommands });
-  const overflow = resolved.length > MAX_EXPLICIT_SKILL_REFERENCES;
-  const skills = resolved.slice(0, MAX_EXPLICIT_SKILL_REFERENCES);
-  if (skills.length === 0) {
-    return { body, overflow, skills };
-  }
-  const instruction = [
-    "Use the following explicitly referenced skills for this request. Read each skill's SKILL.md before acting:",
-    // Hidden skills are absent from the available-skills prompt, so explicit invocation
-    // carries the SKILL.md path the model needs to load them.
-    ...skills.map((skill) =>
-      skill.modelVisible === false && skill.skillFile
-        ? `- ${skill.skillName} (SKILL.md: ${skill.skillFile})`
-        : `- ${skill.skillName}`,
-    ),
-    "",
-    "User request:",
-    body,
-  ].join("\n");
-  return { body: instruction, overflow, skills };
-}
-
-function expandBundleCommandPromptTemplate(template: string, args?: string): string {
-  const normalizedArgs = normalizeOptionalString(args) || "";
-  const rendered = template.includes("$ARGUMENTS")
-    ? template.replaceAll("$ARGUMENTS", normalizedArgs)
-    : template;
-  if (!normalizedArgs || template.includes("$ARGUMENTS")) {
-    return rendered.trim();
-  }
-  return `${rendered.trim()}\n\nUser input:\n${normalizedArgs}`;
-}
-
 function isMentionOnlyResidualText(text: string, wasMentioned: boolean | undefined): boolean {
   if (wasMentioned !== true) {
     return false;
@@ -180,6 +141,7 @@ type InlineActionResult =
       directives: InlineDirectives;
       abortedLastRun: boolean;
       cleanedBody: string;
+      queueModeOverride?: QueueMode;
       explicitSkillSelections?: ExplicitSkillSelection[];
     };
 
@@ -361,19 +323,19 @@ export async function handleInlineActions(params: {
     return { kind: "reply", reply: undefined };
   }
 
-  const slashCommandName = resolveSlashCommandName(command.commandBodyNormalized);
+  const slashCommandName = getStandaloneSlashCommandName(command.commandBodyNormalized);
+  const explicitSkillReferenceBody = command.commandBodyNormalized;
   const hasSkillReferences =
-    command.isAuthorizedSender && hasSkillReferenceCandidate(initialCleanedBody);
+    command.isAuthorizedSender && hasSkillReferenceCandidate(explicitSkillReferenceBody);
+  const hasSkillSlashCandidate =
+    command.isAuthorizedSender &&
+    slashCommandName !== null &&
+    (slashCommandName === "skill" || !getBuiltinSlashCommands().has(slashCommandName));
   const shouldLoadSkillCommands =
-    allowTextCommands &&
-    (hasSkillReferences ||
-      (slashCommandName !== null &&
-        // `/skill …` needs the full skill command list.
-        (slashCommandName === "skill" || !getBuiltinSlashCommands().has(slashCommandName))));
-  const canReusePreloadedSkillCommands = execOverrides === undefined;
+    allowTextCommands && (hasSkillReferences || hasSkillSlashCandidate);
   const skillCommands =
     shouldLoadSkillCommands &&
-    canReusePreloadedSkillCommands &&
+    execOverrides === undefined &&
     params.skillCommands &&
     params.skillCommands.length > 0
       ? params.skillCommands
@@ -388,6 +350,18 @@ export async function handleInlineActions(params: {
             execOverrides,
           })
         : [];
+  const allSkillCommands =
+    allowTextCommands && (hasSkillReferences || hasSkillSlashCandidate) && skillFilter !== undefined
+      ? (await loadSkillCommandsRuntime()).listSkillCommandsForWorkspace({
+          workspaceDir,
+          cfg,
+          agentId,
+          sessionEntry: targetSessionEntry,
+          sessionKey,
+          execOverrides,
+          includeAllowlistHidden: true,
+        })
+      : skillCommands;
 
   const skillInvocation =
     allowTextCommands && skillCommands.length > 0
@@ -494,32 +468,37 @@ export async function handleInlineActions(params: {
       }
     }
 
-    const rewrittenBody = skillInvocation.command.promptTemplate
-      ? expandBundleCommandPromptTemplate(
-          skillInvocation.command.promptTemplate,
-          skillInvocation.args,
-        )
-      : [
-          `Use the "${skillInvocation.command.skillName}" skill for this request.`,
-          skillInvocation.args ? `User input:\n${skillInvocation.args}` : null,
-        ]
-          .filter((entry): entry is string => Boolean(entry))
-          .join("\n\n");
-    ctx.Body = rewrittenBody;
-    ctx.agentText = rewrittenBody;
-    ctx.BodyForAgent = rewrittenBody;
-    sessionCtx.Body = rewrittenBody;
-    sessionCtx.agentText = rewrittenBody;
-    sessionCtx.BodyForAgent = rewrittenBody;
-    sessionCtx.BodyStripped = rewrittenBody;
-    cleanedBody = rewrittenBody;
+    if (skillInvocation.command.promptTemplate) {
+      const rewrittenBody = expandBundleCommandPromptTemplate(
+        skillInvocation.command.promptTemplate,
+        skillInvocation.args,
+      );
+      ctx.Body = rewrittenBody;
+      ctx.agentText = rewrittenBody;
+      ctx.BodyForAgent = rewrittenBody;
+      sessionCtx.Body = rewrittenBody;
+      sessionCtx.agentText = rewrittenBody;
+      sessionCtx.BodyForAgent = rewrittenBody;
+      sessionCtx.BodyStripped = rewrittenBody;
+      cleanedBody = rewrittenBody;
+    }
   }
 
+  const referenced =
+    allowTextCommands &&
+    (hasSkillReferences || hasSkillSlashCandidate) &&
+    !skillInvocation?.command.promptTemplate &&
+    (hasSkillSlashCandidate || resolveSlashCommandName(cleanedBody) === null)
+      ? expandExplicitSkillReferences({
+          text: explicitSkillReferenceBody,
+          skillCommands,
+          allSkillCommands,
+        })
+      : null;
+  const hasExplicitSkillReferences = Boolean(referenced?.skills.length);
+
   const sendInlineReply = async (reply?: ReplyPayload) => {
-    if (!reply) {
-      return;
-    }
-    if (!opts?.onBlockReply) {
+    if (!reply || !opts?.onBlockReply) {
       return;
     }
     await opts.onBlockReply(
@@ -533,7 +512,7 @@ export async function handleInlineActions(params: {
   };
 
   const inlineCommand =
-    allowTextCommands && command.isAuthorizedSender
+    allowTextCommands && command.isAuthorizedSender && !hasExplicitSkillReferences
       ? extractInlineSimpleCommand(cleanedBody)
       : null;
   if (inlineCommand) {
@@ -544,20 +523,12 @@ export async function handleInlineActions(params: {
     sessionCtx.BodyStripped = cleanedBody;
   }
 
-  if (
-    hasSkillReferences &&
-    !skillInvocation &&
-    resolveSlashCommandName(cleanedBody) === null &&
-    skillCommands.length > 0
-  ) {
-    const referenced = applyExplicitSkillReferences(cleanedBody, skillCommands);
-    if (referenced.overflow) {
+  if (referenced) {
+    if (referenced.error) {
       typing.cleanup();
       return {
         kind: "reply",
-        reply: markCommandReplyForDelivery({
-          text: `Too many skill references. Use at most ${MAX_EXPLICIT_SKILL_REFERENCES} skills in one message.`,
-        }),
+        reply: markCommandReplyForDelivery({ text: referenced.error }),
       };
     }
     if (referenced.skills.length > 0) {
@@ -577,6 +548,7 @@ export async function handleInlineActions(params: {
   }
 
   const handleInlineStatus =
+    !hasExplicitSkillReferences &&
     !isDirectiveOnly({
       directives,
       cleanedBody: directives.cleaned,
@@ -584,8 +556,10 @@ export async function handleInlineActions(params: {
       cfg,
       agentId,
       isGroup,
-    }) && inlineStatusRequested;
+    }) &&
+    inlineStatusRequested;
   let didSendInlineStatus = false;
+  let queueModeOverride: QueueMode | undefined;
   if (handleInlineStatus) {
     const { buildStatusReply } = await loadCommandsRuntime();
     const inlineStatusReply = await buildStatusReply({
@@ -667,6 +641,7 @@ export async function handleInlineActions(params: {
       commandBodyNormalized: inlineCommand.command,
     };
     const inlineResult = await runCommands(inlineCommandContext);
+    queueModeOverride = inlineResult.queueModeOverride;
     notifyInlineCommandSessionMetadataChanges();
     if (inlineResult.reply) {
       if (!inlineCommand.cleaned) {
@@ -677,7 +652,7 @@ export async function handleInlineActions(params: {
     }
   }
 
-  if (directiveAck) {
+  if (directiveAck && !hasExplicitSkillReferences) {
     await sendInlineReply(directiveAck);
   }
 
@@ -687,10 +662,11 @@ export async function handleInlineActions(params: {
   }
 
   const shouldRunCommandHandlers =
-    inlineCommand !== null ||
-    directiveAck !== undefined ||
-    inlineStatusRequested ||
-    command.commandBodyNormalized.trim().startsWith("/");
+    !hasExplicitSkillReferences &&
+    (inlineCommand !== null ||
+      directiveAck !== undefined ||
+      inlineStatusRequested ||
+      command.commandBodyNormalized.trim().startsWith("/"));
   if (!shouldRunCommandHandlers) {
     return {
       kind: "continue",
@@ -719,6 +695,7 @@ export async function handleInlineActions(params: {
   const commandBodyBeforeRun = command.commandBodyNormalized;
   const bodyBeforeRun = sessionCtx.agentText;
   const commandResult = await runCommands(command);
+  queueModeOverride = commandResult.queueModeOverride ?? queueModeOverride;
   notifyInlineCommandSessionMetadataChanges();
   if (!commandResult.shouldContinue) {
     typing.cleanup();
@@ -738,6 +715,7 @@ export async function handleInlineActions(params: {
     directives,
     abortedLastRun,
     cleanedBody,
+    ...(queueModeOverride ? { queueModeOverride } : {}),
     ...(explicitSkillSelections ? { explicitSkillSelections } : {}),
   };
 }

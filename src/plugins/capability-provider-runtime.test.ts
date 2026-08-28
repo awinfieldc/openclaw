@@ -128,7 +128,6 @@ vi.mock("./bundled-compat.js", () => ({
 let resolvePluginCapabilityProviders: typeof import("./capability-provider-runtime.js").resolvePluginCapabilityProviders;
 let resolvePluginCapabilityProvider: typeof import("./capability-provider-runtime.js").resolvePluginCapabilityProvider;
 let prepareMediaCapabilityProviders: typeof import("./capability-provider-runtime.js").prepareMediaCapabilityProviders;
-let clearCurrentPluginMetadataSnapshot: typeof import("./current-plugin-metadata-state.js").clearCurrentPluginMetadataSnapshot;
 let setCurrentPluginMetadataSnapshot: typeof import("./current-plugin-metadata-snapshot.js").setCurrentPluginMetadataSnapshot;
 let clearPluginMetadataLifecycleCaches: typeof import("./plugin-metadata-lifecycle.js").clearPluginMetadataLifecycleCaches;
 
@@ -232,7 +231,10 @@ function requireManifestRegistryLoadParams(index = 0): Record<string, unknown> {
   return call[0];
 }
 
-function expectManifestRegistryLoad(index: number, config: OpenClawConfig | Record<string, never>) {
+function expectManifestRegistryLoad(
+  index: number,
+  config: OpenClawConfig | Record<string, never> | undefined,
+) {
   const params = requireManifestRegistryLoadParams(index);
   expect(params.config).toEqual(config);
   expect(params.env).toBe(process.env);
@@ -359,13 +361,11 @@ describe("resolvePluginCapabilityProviders", () => {
       resolvePluginCapabilityProvider,
       resolvePluginCapabilityProviders,
     } = await import("./capability-provider-runtime.js"));
-    ({ clearCurrentPluginMetadataSnapshot } = await import("./current-plugin-metadata-state.js"));
     ({ setCurrentPluginMetadataSnapshot } = await import("./current-plugin-metadata-snapshot.js"));
     ({ clearPluginMetadataLifecycleCaches } = await import("./plugin-metadata-lifecycle.js"));
   });
 
   beforeEach(() => {
-    clearCurrentPluginMetadataSnapshot();
     clearPluginMetadataLifecycleCaches();
     mocks.resolveRuntimePluginRegistry.mockReset();
     mocks.resolveRuntimePluginRegistry.mockReturnValue(undefined);
@@ -386,7 +386,7 @@ describe("resolvePluginCapabilityProviders", () => {
   });
 
   afterEach(() => {
-    clearCurrentPluginMetadataSnapshot();
+    clearPluginMetadataLifecycleCaches();
   });
 
   it("resolves bundled capability plugins from the current metadata snapshot", () => {
@@ -881,6 +881,10 @@ describe("resolvePluginCapabilityProviders", () => {
         generateImage: async () => ({ images: [] }),
       },
     } as never);
+    addCapabilityProvider(loaded, "imageGenerationProviders", {
+      id: "xai",
+      provider: { defaultModel: "shadowed-model" },
+    });
     mocks.loadPluginManifestRegistryCore.mockReturnValue({
       plugins: [
         {
@@ -906,6 +910,8 @@ describe("resolvePluginCapabilityProviders", () => {
     });
 
     expectResolvedCapabilityProviderIds(providers, ["xai", "fal"]);
+    expect(providers[0]).toBe(active.imageGenerationProviders[0]?.provider);
+    expect(providers[1]).toBe(loaded.imageGenerationProviders[0]?.provider);
     expect(mocks.resolveRuntimePluginRegistry).toHaveBeenCalledWith();
     expectActiveRegistryLookup(["fal", "xai"]);
   });
@@ -1010,29 +1016,33 @@ describe("resolvePluginCapabilityProviders", () => {
     expectActiveRegistryLookup(["openai"]);
   });
 
-  it("loads a voiceModel provider that is missing from an active speech registry", () => {
+  it.each([
+    ["voice model", "speechProviders", { agents: { defaults: { voiceModel: "openai/model" } } }],
+    ["sole Talk speech", "speechProviders", { talk: { providers: { openai: {} } } }],
+    [
+      "Talk speech alias",
+      "speechProviders",
+      { talk: { provider: "voice-alias", providers: { "voice-alias": {} } } },
+    ],
+    [
+      "Talk realtime alias",
+      "realtimeVoiceProviders",
+      { talk: { realtime: { provider: "voice-alias", providers: { "voice-alias": {} } } } },
+    ],
+  ] as const)("loads a missing provider requested by %s", (_source, key, cfg) => {
     const active = createEmptyPluginRegistry();
-    addSpeechProvider(active, "google", { pluginName: "Google", label: "Google" });
+    addCapabilityProvider(active, key, { id: "google" });
     const loaded = createEmptyPluginRegistry();
-    addSpeechProvider(loaded, "openai", { pluginName: "OpenAI", label: "OpenAI" });
+    addCapabilityProvider(loaded, key, { id: "openai", provider: { aliases: ["voice-alias"] } });
     setCapabilityManifestPlugins([
-      { id: "google", contracts: { speechProviders: ["google"] } },
-      { id: "openai", contracts: { speechProviders: ["openai"] } },
+      { id: "google", contracts: { [key]: ["google"] } },
+      { id: "openai", contracts: { [key]: ["openai", "voice-alias"] } },
     ]);
     mocks.resolveRuntimePluginRegistry.mockImplementation((params?: unknown) =>
       params === undefined ? active : loaded,
     );
 
-    const providers = resolvePluginCapabilityProviders({
-      key: "speechProviders",
-      cfg: {
-        agents: {
-          defaults: {
-            voiceModel: { primary: "openai/gpt-4o-mini-tts" },
-          },
-        },
-      } as OpenClawConfig,
-    });
+    const providers = resolvePluginCapabilityProviders({ key, cfg: cfg as OpenClawConfig });
 
     expectResolvedCapabilityProviderIds(providers, ["google", "openai"]);
     expectActiveRegistryLookup(["openai"]);
@@ -1364,9 +1374,9 @@ describe("resolvePluginCapabilityProviders", () => {
     expectActiveRegistryLookup(["google"]);
     expect(mocks.loadBundledCapabilityRuntimeRegistry).toHaveBeenCalledWith({
       pluginIds: ["google"],
-      env: process.env,
+      onlyPluginIds: ["google"],
+      activate: false,
       config: { tts: { provider: "google" } },
-      pluginSdkResolution: undefined,
     });
   });
 
@@ -1396,9 +1406,9 @@ describe("resolvePluginCapabilityProviders", () => {
     expectResolvedCapabilityProviderIds(providers, ["openai", "google"]);
     expect(mocks.loadBundledCapabilityRuntimeRegistry).toHaveBeenCalledWith({
       pluginIds: ["google"],
-      env: process.env,
+      onlyPluginIds: ["google"],
+      activate: false,
       config: { tts: { provider: "google" } },
-      pluginSdkResolution: undefined,
     });
   });
 
@@ -1668,7 +1678,7 @@ describe("resolvePluginCapabilityProviders", () => {
     const providers = resolvePluginCapabilityProviders({ key: "mediaUnderstandingProviders" });
 
     expectResolvedCapabilityProviderIds(providers, ["google"]);
-    expectManifestRegistryLoad(0, {});
+    expectManifestRegistryLoad(0, undefined);
     expectActiveRegistryLookup(["google"]);
   });
 

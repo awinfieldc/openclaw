@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { toErrorObject as toLintErrorObject } from "openclaw/plugin-sdk/error-runtime";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
 import type { OpenKeyedStoreOptions } from "openclaw/plugin-sdk/plugin-state-runtime";
 import {
@@ -17,6 +18,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { applyCliRuntimeRecallTimeoutDefault } from "./config.js";
 import plugin, { testing } from "./index.js";
 import { resolveActiveRecallForRun } from "./recall-state.js";
+import * as transcriptWatch from "./transcript-watch.js";
 
 // Match only lone surrogates so valid supplementary-plane characters remain allowed.
 const UNPAIRED_SURROGATE_RE =
@@ -72,6 +74,22 @@ vi.mock("openclaw/plugin-sdk/memory-host-search", () => ({
   closeActiveMemorySearchManager: hoisted.closeActiveMemorySearchManager,
   getActiveMemorySearchManager: hoisted.getActiveMemorySearchManager,
 }));
+
+vi.mock("openclaw/plugin-sdk/memory-host-core", async () => {
+  const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/memory-host-core")>(
+    "openclaw/plugin-sdk/memory-host-core",
+  );
+  return {
+    ...actual,
+    getMemoryCapabilityRegistration: () => ({
+      pluginId: "memory-core",
+      capability: {
+        deterministicRecallToolName: "memory_search",
+        supportsPrivateTranscriptRecall: true,
+      },
+    }),
+  };
+});
 
 vi.mock("openclaw/plugin-sdk/session-store-runtime", async () => {
   const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/session-store-runtime")>(
@@ -557,6 +575,11 @@ describe("active-memory plugin", () => {
         agentId: "main",
         trigger: "user",
         messageProvider: "webchat",
+        toolAuthority: {
+          fingerprint: "allowed-memory-authority",
+          allows: () => true,
+          assertActive: () => undefined,
+        },
         ...defaultSession,
         ...context,
       },
@@ -720,104 +743,67 @@ describe("active-memory plugin", () => {
     const [hookName, handler, options] = firstHookRegistration();
     expect(hookName).toBe("before_prompt_build");
     expect(typeof handler).toBe("function");
-    expect(options).toEqual({ timeoutMs: 153_000 });
+    expect(options).toEqual({ timeoutMs: 153_000, requiresToolAuthority: true });
     expect(hookOptions.before_prompt_build?.timeoutMs).toBe(153_000);
-    expect(typeof hooks.before_model_resolve).toBe("function");
+    expect(hooks.before_model_resolve).toBeUndefined();
     expect(typeof hooks.agent_end).toBe("function");
   });
 
-  it("prewarms a cold lane-1 lookup before the first QA-channel turn budget starts", async () => {
-    registerPluginConfig({ mode: "off" });
-    let cold = true;
-    const simulatedBudgetMs = 500;
-    const coldDelayMs = 650;
-    const runtimePreparationMs = 500;
-    const runId = "run-cold-qa-channel";
-    const triggerEntry = {
-      path: "MEMORY.md",
-      startLine: 1,
-      endLine: 1,
-      score: 1,
-      snippet: "Prefer aisle seats.",
-      source: "memory" as const,
-      originClass: "agent" as const,
-      triggers: "booking a flight",
-    };
-    const warmLookup = async () => {
-      if (cold) {
-        await new Promise<void>((resolve) => {
-          setTimeout(resolve, coldDelayMs);
-        });
-        cold = false;
-      }
-    };
-    const search = vi.fn(async () => {
-      await warmLookup();
-      return [];
-    });
-    const listTriggerCandidates = vi.fn(async () => {
-      await warmLookup();
-      return [triggerEntry];
-    });
-    hoisted.getActiveMemorySearchManager.mockResolvedValue({
-      manager: { search, listTriggerCandidates },
-    } as never);
+  it("does not read or inject memory when the turn authority denies recall tools", async () => {
+    const assertActive = vi.fn();
 
-    const prewarmResult = await requireHook("before_model_resolve")(
-      { prompt: "Help when booking a flight" },
-      {
-        agentId: "main",
-        runId,
-        trigger: "user",
-        sessionKey: "agent:main:qa-channel:direct:owner",
-        messageProvider: "qa-channel",
-        channelId: "owner",
-      },
-    );
-    expect(prewarmResult).toBeUndefined();
-    expect(coldDelayMs).toBeGreaterThan(simulatedBudgetMs);
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, runtimePreparationMs);
-    });
-
-    const startedAt = performance.now();
     const result = await runPromptBuild(
-      { prompt: "Help when booking a flight" },
+      { prompt: "what wings should i order?" },
       {
-        sessionKey: "agent:main:qa-channel:direct:owner",
-        messageProvider: "qa-channel",
-        channelId: "owner",
-        runId,
+        toolAuthority: {
+          fingerprint: "denied-memory-authority",
+          allows: () => false,
+          assertActive,
+        },
       },
     );
-    const firstTurnMs = performance.now() - startedAt;
 
-    expectPrependContextContains(result, "Prefer aisle seats.");
-    expect(cold).toBe(false);
-    expect(firstTurnMs).toBeLessThan(simulatedBudgetMs);
-    expect(search).toHaveBeenCalledTimes(1);
-    expect(listTriggerCandidates).toHaveBeenCalledTimes(1);
+    expect(result).toBeUndefined();
+    expect(assertActive).toHaveBeenCalled();
+    expect(hoisted.getActiveMemorySearchManager).not.toHaveBeenCalled();
     expect(runEmbeddedAgent).not.toHaveBeenCalled();
   });
 
-  it("does not prewarm a session disabled with /active-memory off", async () => {
-    const sessionKey = "agent:main:qa-channel:direct:paused";
-    seedSession(sessionKey, "s-paused");
-    await runActiveMemoryCommand({ sessionKey, args: "off" });
-
-    await requireHook("before_model_resolve")(
-      { prompt: "Help when booking a flight" },
+  it("does not inject recall that completes after the turn authority closes", async () => {
+    let releaseRecall: () => void = () => {
+      throw new Error("recall gate was not initialized");
+    };
+    const recallGate = new Promise<void>((resolve) => {
+      releaseRecall = resolve;
+    });
+    runEmbeddedAgent.mockImplementationOnce(async (params: { sessionFile: string }) => {
+      await recallGate;
+      await writeUsableMemoryTranscript(params.sessionFile, "stale private memory");
+      return { payloads: [{ text: "- stale private memory" }] };
+    });
+    let authorityActive = true;
+    const result = runPromptBuild(
+      { prompt: "what should i remember?" },
       {
-        agentId: "main",
-        runId: "run-paused-qa-channel",
-        trigger: "user",
-        sessionKey,
-        messageProvider: "qa-channel",
-        channelId: "paused",
+        toolAuthority: {
+          fingerprint: "closing-memory-authority",
+          allows: () => true,
+          assertActive: () => {
+            if (!authorityActive) {
+              throw new Error("turn authority is no longer active");
+            }
+          },
+        },
       },
     );
+    await vi.waitFor(() => {
+      expect(runEmbeddedAgent).toHaveBeenCalledOnce();
+    });
 
-    expect(hoisted.getActiveMemorySearchManager).not.toHaveBeenCalled();
+    authorityActive = false;
+    releaseRecall();
+
+    await expect(result).resolves.toBeUndefined();
   });
 
   it("keeps the outer hook timeout at the live-config ceiling", () => {
@@ -931,7 +917,7 @@ describe("active-memory plugin", () => {
     expect(secondSessionKey).not.toBe(firstSessionKey);
   });
 
-  it("shares recall results across changed-prompt retries in one run", async () => {
+  it("does not share recall results across changed prompts in one run", async () => {
     const context = {
       runId: "run-changed-prompt-retry",
       sessionKey: "agent:main:changed-prompt-retry",
@@ -945,10 +931,10 @@ describe("active-memory plugin", () => {
 
     expectPrependContextContains(first, "lemon pepper wings");
     expectPrependContextContains(second, "lemon pepper wings");
-    expect(runEmbeddedAgent).toHaveBeenCalledTimes(1);
+    expect(runEmbeddedAgent).toHaveBeenCalledTimes(2);
   });
 
-  it("joins concurrent recall attempts in one run", async () => {
+  it("joins concurrent identical recall attempts in one run", async () => {
     let releaseRecall: () => void = () => {
       throw new Error("recall gate was not initialized");
     };
@@ -969,7 +955,7 @@ describe("active-memory plugin", () => {
     await vi.waitFor(() => {
       expect(runEmbeddedAgent).toHaveBeenCalledTimes(1);
     });
-    const second = runPromptBuild({ prompt: "what wings did I order last time?" }, context);
+    const second = runPromptBuild({ prompt: "what wings should i order?" }, context);
     await new Promise<void>((resolve) => {
       setImmediate(resolve);
     });
@@ -2127,7 +2113,11 @@ describe("active-memory plugin", () => {
             score: 1,
             snippet: "Prefer aisle seats.",
             source: "memory" as const,
-            originClass: "agent",
+            provenance: {
+              originClass: "agent" as const,
+              sessionKind: "interactive" as const,
+              observedAt: 1,
+            },
             triggers: "booking a flight",
           },
         ]),
@@ -4614,53 +4604,130 @@ describe("active-memory plugin", () => {
     expectLinesToContain(lines, `Active Memory Debug: ${warning} ${action}`);
   });
 
-  it("uses configured memory evidence from a rotated embedded transcript", async () => {
-    testing.setMinimumTimeoutMsForTests(1);
-    testing.setSetupGraceTimeoutMsForTests(0);
-    registerPluginConfig({
-      timeoutMs: 1_000,
-      toolsAllow: ["memory_get", "memory_search"],
-      logging: true,
-    });
-    const sessionKey = "agent:main:rotated-memory-evidence";
-    seedSession(sessionKey, "s-rotated-memory-evidence", 0);
-    runEmbeddedAgent.mockImplementationOnce(async (params: { sessionFile: string }) => {
-      await writeTranscriptJsonl(params.sessionFile, [
-        {
+  it.each([false, true])(
+    "uses configured memory evidence from a rotated embedded transcript (stale poll: %s)",
+    async (stalePoll) => {
+      testing.setMinimumTimeoutMsForTests(1);
+      testing.setSetupGraceTimeoutMsForTests(0);
+      registerPluginConfig({
+        timeoutMs: 1_000,
+        toolsAllow: ["memory_get", "memory_search"],
+        logging: true,
+      });
+      const sessionKey = "agent:main:rotated-memory-evidence";
+      seedSession(sessionKey, "s-rotated-memory-evidence", 0);
+      const cleanupStarted = createDeferred<void>();
+      const releaseCleanup = createDeferred<void>();
+      const watcherStopped = createDeferred<void>();
+      const staleReadStarted = createDeferred<void>();
+      const releaseStaleRead = createDeferred<void>();
+      if (stalePoll) {
+        const transcriptRuntime = await import("openclaw/plugin-sdk/session-transcript-runtime");
+        const readDelta = transcriptRuntime.readSessionTranscriptRawDelta;
+        let heldRead = false;
+        vi.spyOn(transcriptRuntime, "readSessionTranscriptRawDelta").mockImplementation(
+          async (params) => {
+            const page = await readDelta(params);
+            if (!heldRead && page.kind === "page" && page.events.length > 0) {
+              heldRead = true;
+              staleReadStarted.resolve();
+              await releaseStaleRead.promise;
+            }
+            return page;
+          },
+        );
+      }
+      const cleanup = expectDefined(
+        hoisted.cleanupSessionLifecycleArtifacts.getMockImplementation(),
+        "recall cleanup fixture",
+      );
+      hoisted.cleanupSessionLifecycleArtifacts.mockImplementationOnce(async (params) => {
+        cleanupStarted.resolve();
+        await releaseCleanup.promise;
+        return await cleanup(params);
+      });
+      const watchTerminalMemorySearchResult = transcriptWatch.watchTerminalMemorySearchResult;
+      vi.spyOn(transcriptWatch, "watchTerminalMemorySearchResult").mockImplementation((params) => {
+        const watch = watchTerminalMemorySearchResult(params);
+        return {
+          ...watch,
+          stop() {
+            watch.stop();
+            watcherStopped.resolve();
+          },
+        };
+      });
+      runEmbeddedAgent.mockImplementationOnce(async (params: { sessionFile: string }) => {
+        if (stalePoll) {
+          await writeTranscriptJsonl(params.sessionFile, [
+            {
+              message: {
+                role: "toolResult",
+                toolName: "memory_search",
+                details: { disabled: true, error: "embedding request failed" },
+              },
+            },
+          ]);
+          await staleReadStarted.promise;
+        }
+        const memoryResult = {
           message: {
             role: "toolResult",
             toolName: "memory_get",
             details: { path: "memory/food.md", text: "User usually orders ramen." },
           },
-        },
-      ]);
-      const activeSessionFile = path.join(path.dirname(params.sessionFile), "rotated.jsonl");
-      await writeTranscriptJsonl(activeSessionFile, [
-        {
-          message: {
-            role: "toolResult",
-            toolName: "memory_search",
-            details: {
-              disabled: true,
-              error: "embedding request failed",
+        };
+        if (stalePoll) {
+          await fs.appendFile(params.sessionFile, `${JSON.stringify(memoryResult)}\n`, "utf8");
+        } else {
+          await writeTranscriptJsonl(params.sessionFile, [memoryResult]);
+        }
+        const activeSessionFile = path.join(path.dirname(params.sessionFile), "rotated.jsonl");
+        await writeTranscriptJsonl(activeSessionFile, [
+          {
+            message: {
+              role: "toolResult",
+              toolName: "memory_search",
+              details: {
+                disabled: true,
+                error: "embedding request failed",
+              },
             },
           },
-        },
-      ]);
-      return {
-        payloads: [{ text: "User usually orders ramen." }],
-        meta: { agentMeta: { sessionFile: activeSessionFile } },
-      };
-    });
+        ]);
+        return {
+          payloads: [{ text: "User usually orders ramen." }],
+          meta: { agentMeta: { sessionFile: activeSessionFile } },
+        };
+      });
 
-    const result = await runPromptBuild(
-      { prompt: "what food do i usually order? rotated transcript" },
-      { sessionKey },
-    );
+      const resultPromise = runPromptBuild(
+        { prompt: "what food do i usually order? rotated transcript" },
+        { sessionKey },
+      );
+      try {
+        await cleanupStarted.promise;
+        releaseStaleRead.resolve();
+        // Drain continuations of the old read after execution has completed;
+        // a stopped watcher must not publish that stale unavailable snapshot.
+        await new Promise<void>((resolve) => {
+          setImmediate(resolve);
+        });
+        // The completed run already has evidence; pending cleanup must not
+        // let a later transcript replace that grounded result.
+        await watcherStopped.promise;
+      } finally {
+        releaseStaleRead.resolve();
+        releaseCleanup.resolve();
+      }
+      const result = await resultPromise;
 
-    expectPrependContextContains(result, "User usually orders ramen.");
-    expectLinesToContain(getActiveMemoryLines(sessionKey), "status=ok");
-  });
+      expect(result, JSON.stringify(api.logger.info.mock.calls)).toMatchObject({
+        prependContext: expect.stringContaining("User usually orders ramen."),
+      });
+      expectLinesToContain(getActiveMemoryLines(sessionKey), "status=ok");
+    },
+  );
 
   it("rejects completed output when only a rotated transcript reports unavailable memory", async () => {
     testing.setMinimumTimeoutMsForTests(1);
@@ -5602,6 +5669,8 @@ describe("active-memory plugin", () => {
           agentId: "main",
           sessionKey,
           query: `cache pressure prompt ${index}`,
+          authorityFingerprint: "cache-authority",
+          recallToolNames: ["memory_search"],
         }),
         {
           status: "ok",
@@ -5619,6 +5688,8 @@ describe("active-memory plugin", () => {
           agentId: "main",
           sessionKey,
           query: "cache pressure prompt 0",
+          authorityFingerprint: "cache-authority",
+          recallToolNames: ["memory_search"],
         }),
       ),
     ).toBeUndefined();
@@ -5627,10 +5698,42 @@ describe("active-memory plugin", () => {
         agentId: "main",
         sessionKey,
         query: "cache pressure prompt 1",
+        authorityFingerprint: "cache-authority",
+        recallToolNames: ["memory_search"],
       }),
     );
     expect(cached?.status).toBe("ok");
     expect(cached?.summary).toBe("memory 1");
+  });
+
+  it("partitions cached recall by turn authority and memory resource scope", () => {
+    const base = {
+      agentId: "main",
+      sessionKey: "agent:main:cache-scope",
+      query: "same prompt",
+      authorityFingerprint: "authority-a",
+      recallToolNames: ["memory_search"],
+      memorySlot: "memory-core",
+      activeProjectKeys: ["project-a"],
+      modelProviderId: "openai",
+      modelId: "gpt-5",
+    };
+
+    expect(testing.buildCacheKey(base)).not.toBe(
+      testing.buildCacheKey({ ...base, authorityFingerprint: "authority-b" }),
+    );
+    expect(testing.buildCacheKey(base)).not.toBe(
+      testing.buildCacheKey({ ...base, activeProjectKeys: ["project-b"] }),
+    );
+    expect(testing.buildCacheKey(base)).not.toBe(
+      testing.buildCacheKey({ ...base, modelId: "gpt-5-mini" }),
+    );
+    expect(testing.buildCacheKey(base)).not.toBe(
+      testing.buildCacheKey({ ...base, recallToolNames: ["memory_get"] }),
+    );
+    expect(testing.buildCacheKey(base)).not.toBe(
+      testing.buildCacheKey({ ...base, resourceScope: "same-agent-private:sessions" }),
+    );
   });
 
   it("drops cached active-memory results when the current clock is not a valid date timestamp", () => {
@@ -5639,6 +5742,8 @@ describe("active-memory plugin", () => {
       agentId: "main",
       sessionKey: "agent:main:invalid-clock-cache",
       query: "cache invalid clock prompt",
+      authorityFingerprint: "cache-authority",
+      recallToolNames: ["memory_search"],
     });
     testing.setCachedResult(
       cacheKey,
@@ -5662,6 +5767,8 @@ describe("active-memory plugin", () => {
       agentId: "main",
       sessionKey: "agent:main:overflow-cache",
       query: "cache overflow prompt",
+      authorityFingerprint: "cache-authority",
+      recallToolNames: ["memory_search"],
     });
     testing.setCachedResult(
       cacheKey,

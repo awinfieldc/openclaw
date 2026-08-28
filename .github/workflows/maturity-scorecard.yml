@@ -203,7 +203,7 @@ jobs:
           fi
 
       - name: Checkout selected ref
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ inputs.ref }}
@@ -335,7 +335,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout trusted workflow source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ needs.validate_selected_ref.outputs.workflow_repository }}
           ref: ${{ needs.validate_selected_ref.outputs.workflow_sha }}
@@ -395,7 +395,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout selected ref
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.validate_selected_ref.outputs.selected_revision }}
           fetch-depth: 0
@@ -406,6 +406,7 @@ jobs:
       - name: Setup Node environment
         uses: ./.github/actions/setup-node-env
         with:
+          cache-mode: restore
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "false"
 
@@ -590,6 +591,16 @@ jobs:
             exit 1
           fi
 
+      - name: Prepare aggregate QA evidence for rendering
+        env:
+          QA_EVIDENCE_PATH: ${{ steps.evidence.outputs.qa_evidence_path }}
+        run: |
+          set -euo pipefail
+          render_evidence_dir=".artifacts/maturity-render-evidence"
+          rm -rf "$render_evidence_dir"
+          mkdir -p "$render_evidence_dir"
+          install -m 0644 "$QA_EVIDENCE_PATH" "$render_evidence_dir/qa-evidence.json"
+
       - name: Validate maturity score sources
         run: |
           node --import tsx --input-type=module <<'NODE'
@@ -617,7 +628,7 @@ jobs:
             --output-dir .artifacts/maturity-docs \
             --static-assets-dir .artifacts/maturity-docs/assets/maturity \
             --scores qa/maturity-scores.yaml \
-            --evidence-dir .artifacts/maturity-evidence \
+            --evidence-dir .artifacts/maturity-render-evidence \
             --strict-inputs \
             "${allow_failures_args[@]}"
           {
@@ -642,7 +653,7 @@ jobs:
           pnpm maturity:render -- \
             --output-dir docs \
             --scores qa/maturity-scores.yaml \
-            --evidence-dir .artifacts/maturity-evidence \
+            --evidence-dir .artifacts/maturity-render-evidence \
             --strict-inputs \
             "${allow_failures_args[@]}"
 
@@ -687,7 +698,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout trusted workflow source
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ needs.validate_selected_ref.outputs.workflow_repository }}
           ref: ${{ needs.validate_selected_ref.outputs.workflow_sha }}
@@ -695,7 +706,7 @@ jobs:
           submodules: false
 
       - name: Checkout selected ref
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.validate_selected_ref.outputs.selected_revision }}
           path: selected
@@ -795,11 +806,7 @@ jobs:
             qa/maturity-scores.yaml
             docs/maturity/scorecard.md
             docs/maturity/taxonomy.md
-          invalidation-paths: |
-            .
-            :(exclude)qa/maturity-scores.yaml
-            :(exclude)docs/maturity/scorecard.md
-            :(exclude)docs/maturity/taxonomy.md
+          invalidation-paths: ""
           overlap-policy: fail
           pr-body: |
             ## What Problem This Solves

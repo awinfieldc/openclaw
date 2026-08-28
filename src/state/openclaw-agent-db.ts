@@ -16,6 +16,7 @@ import {
   runSqliteImmediateTransactionSync,
   type SqliteTransactionOptions,
 } from "../infra/sqlite-transaction.js";
+import { isSqliteSchemaVersionError } from "../infra/sqlite-user-version.js";
 import {
   configureSqliteConnectionPragmas,
   configureSqlitePreSchemaPragmas,
@@ -30,6 +31,8 @@ import type {
   OpenClawAgentDatabaseOwnerInspection,
 } from "./openclaw-agent-db-contract.js";
 import {
+  AGENT_DATABASE_MAINTENANCE_LEASE,
+  assertNoOpenClawAgentDatabaseLeases,
   claimOpenClawAgentDatabaseLease,
   releaseOpenClawAgentDatabaseLease,
 } from "./openclaw-agent-db-lease.js";
@@ -62,6 +65,7 @@ import {
   OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
   type OpenClawStateDatabaseOptions,
 } from "./openclaw-state-db.js";
+import { withOpenClawStateLease, type OpenClawStateLeaseContext } from "./openclaw-state-lease.js";
 
 export {
   OPENCLAW_AGENT_SCHEMA_VERSION,
@@ -351,7 +355,7 @@ export function openOpenClawAgentDatabase(
         db.close();
         if (
           err instanceof Error &&
-          (err.name === "SqliteSchemaVersionError" || isTerminalSqliteIntegrityError(err))
+          (isSqliteSchemaVersionError(err) || isTerminalSqliteIntegrityError(err))
         ) {
           recordOpenClawAgentDatabaseOpenFailure(pathname, err);
         }
@@ -680,6 +684,30 @@ export function closeOpenClawAgentDatabases(): void {
   if (removedIncognito) {
     incognitoDatabaseGeneration += 1;
   }
+}
+
+/** Fence cross-process agent writers while Doctor reconciles shared plugin state. */
+export function withAgentDatabaseMaintenanceLease<T>(
+  options: Pick<OpenClawStateDatabaseOptions, "env">,
+  run: (maintenance: OpenClawStateLeaseContext) => Promise<T>,
+): Promise<T> {
+  return withOpenClawStateLease(
+    {
+      ...AGENT_DATABASE_MAINTENANCE_LEASE,
+      database: { scope: "shared", options },
+      leaseMs: 60_000,
+      waitMs: 5_000,
+      leaseLabel: "agent database maintenance lease",
+      operationLabel: "agent.database.maintenance.lease",
+    },
+    (maintenance) => {
+      // Claiming first closes the cross-process gap: every later writer claim
+      // observes this same lease inside its authoritative state transaction.
+      closeOpenClawAgentDatabases();
+      assertNoOpenClawAgentDatabaseLeases(maintenance, options);
+      return run(maintenance);
+    },
+  );
 }
 
 /** Close cached agent handles and clear terminal failure latches for test isolation. */

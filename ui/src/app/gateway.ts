@@ -1,4 +1,4 @@
-import type { ControlUiBootstrapProfileHint } from "../../../src/gateway/control-ui-contract.js";
+import type { ControlUiBootstrapProfileHint } from "../../../src/gateway/control-ui-bootstrap-contract.js";
 import type { EventLogEntry } from "../api/event-log.ts";
 import type { GatewayBrowserClient, GatewayEventListener, GatewayHelloOk } from "../api/gateway.ts";
 import type { AuthenticatedUser } from "./user-profile.ts";
@@ -6,6 +6,7 @@ import type { AuthenticatedUser } from "./user-profile.ts";
 export type ApplicationGatewayPhase =
   | "stopped"
   | "connecting"
+  | "starting"
   | "connected"
   | "reconnecting"
   | "reload-required"
@@ -15,6 +16,7 @@ export type ApplicationGatewaySnapshot = {
   client: GatewayBrowserClient | null;
   phase: ApplicationGatewayPhase;
   offlineStable: boolean;
+  restartPending?: boolean;
   hello: GatewayHelloOk | null;
   canvasPluginSurfaceUrl: string | null;
   assistantAgentId: string | null;
@@ -40,6 +42,7 @@ export type ApplicationGatewayConnectOptions = Partial<ApplicationGatewayConnect
 export type ApplicationGateway = {
   readonly snapshot: ApplicationGatewaySnapshot;
   readonly connection: ApplicationGatewayConnection;
+  readonly connectionRevision: number;
   readonly eventLog: readonly EventLogEntry[];
   connect: (connection?: ApplicationGatewayConnectOptions) => void;
   setSessionKey: (sessionKey: string) => void;
