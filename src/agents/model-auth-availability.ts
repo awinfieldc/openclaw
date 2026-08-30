@@ -15,6 +15,8 @@ import type {
   ProviderModelRouteResolution,
   ProviderModelRouteSource,
 } from "../plugin-sdk/provider-model-types.js";
+import { normalizePluginsConfig } from "../plugins/config-state.js";
+import { passesManifestOwnerBasePolicy } from "../plugins/manifest-owner-policy.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
 import { isValidSecretRef } from "../secrets/ref-contract.js";
 import type { PreparedAgentCredentialModes } from "./agent-auth-credential-modes.js";
@@ -62,6 +64,7 @@ import {
 } from "./model-auth-provider-config.js";
 import { resolveManagedSecretRefRuntimeProviderAuth } from "./model-auth-runtime-config.js";
 import { splitTrailingAuthProfile } from "./model-ref-profile.js";
+import { resolveCliRuntimeExecutionProvider } from "./model-runtime-aliases.js";
 import {
   createOpenAIModelRoutesResolver,
   resolveConfiguredOpenAIAuthMode,
@@ -115,6 +118,9 @@ export type ModelAuthAvailabilityEvaluation = {
 };
 export type ModelAuthAvailabilityResolver = {
   providerDiscoveryProviderIds: readonly string[];
+  resolvePreparedRuntimeAuthMode(
+    provider: string,
+  ): PreparedAgentCredentialModes[string] | undefined;
   evaluateModelAuth(
     provider: string,
     ref?: ModelAuthAvailabilityRef,
@@ -125,6 +131,68 @@ export type ModelAuthAvailabilityResolver = {
   ): ModelAuthAvailability;
   hasSyntheticAuth(provider: string): boolean;
 };
+
+export function applyCliRuntimeModelAuthAvailability(params: {
+  authResolver: ModelAuthAvailabilityResolver;
+  evaluation: ModelAuthAvailabilityEvaluation;
+  cfg: OpenClawConfig;
+  agentId?: string;
+  metadataSnapshot?: PluginMetadataSnapshot;
+  provider: string;
+  modelId?: string;
+}): ModelAuthAvailabilityEvaluation {
+  if (
+    params.evaluation.routeResolution !== null ||
+    normalizeProviderId(params.provider) === "openai"
+  ) {
+    return params.evaluation;
+  }
+  const runtimeProvider = resolveCliRuntimeExecutionProvider({
+    provider: params.provider,
+    cfg: params.cfg,
+    agentId: params.agentId,
+    modelId: params.modelId,
+    metadataSnapshot: params.metadataSnapshot,
+  });
+  if (
+    !runtimeProvider ||
+    normalizeProviderId(runtimeProvider) === normalizeProviderId(params.provider)
+  ) {
+    return params.evaluation;
+  }
+  const runtimeOwners = params.metadataSnapshot?.owners?.cliBackends.get(
+    normalizeProviderId(runtimeProvider),
+  );
+  if (runtimeOwners?.length) {
+    const normalizedPluginConfig = normalizePluginsConfig(params.cfg.plugins);
+    if (
+      !runtimeOwners.some((pluginId) =>
+        passesManifestOwnerBasePolicy({
+          plugin: { id: pluginId },
+          normalizedConfig: normalizedPluginConfig,
+        }),
+      )
+    ) {
+      return {
+        ...params.evaluation,
+        availability: false,
+        unavailableReason: "missing-auth",
+        unavailableUntil: undefined,
+      };
+    }
+  }
+  const runtimeAuthMode = params.authResolver.resolvePreparedRuntimeAuthMode(runtimeProvider);
+  // The prepared native-runtime result is authoritative for this route. Provider
+  // credentials cannot prove that the separately authenticated CLI is usable.
+  return runtimeAuthMode
+    ? {
+        availability: true,
+        routeResolution: null,
+        selectedAuthMode: runtimeAuthMode,
+        evidence: "runtime",
+      }
+    : { availability: undefined, routeResolution: null };
+}
 type CreateModelAuthAvailabilityResolverParams = {
   cfg: OpenClawConfig;
   authStore: AuthProfileStore;
@@ -781,18 +849,14 @@ export function createModelAuthAvailabilityResolver(
         evidence: "profile",
       };
     }
+    // Direct policy adds retry times only for unavailable inline keys; unknown reasons stay hidden.
+    const { unavailableReason, ...evaluation } = directEvaluation;
     return {
-      availability: fromProviderModelAuthReadiness(source.readiness),
+      ...evaluation,
       ...(source.readiness === "unavailable"
-        ? {
-            unavailableReason: directEvaluation.unavailableReason ?? "auth-failed",
-            ...(directEvaluation.unavailableUntil !== undefined
-              ? { unavailableUntil: directEvaluation.unavailableUntil }
-              : {}),
-          }
+        ? { unavailableReason: unavailableReason ?? "auth-failed" }
         : {}),
       selectedAuthMode: source.mode,
-      ...(source.evidence === "none" ? {} : { evidence: source.evidence }),
     };
   };
   const directPolicy = (provider: string, target: AuthTarget) => {
@@ -840,7 +904,7 @@ export function createModelAuthAvailabilityResolver(
     provider: string,
     ref: ModelAuthAvailabilityRef,
     target: AuthTarget,
-  ) => {
+  ): AuthSourceEvaluation | undefined => {
     if (ref.lockedProfileId?.trim()) {
       return undefined;
     }
@@ -868,7 +932,16 @@ export function createModelAuthAvailabilityResolver(
     });
     const decision = selectProviderModelAuthSources({ provider, plan });
     return decision.kind === "rejected"
-      ? { ...decision, ...rejectedSourceEvaluation(decision.reason, plan, target) }
+      ? {
+          ...rejectedSourceEvaluation(decision.reason, plan, target),
+          evidence: "profile",
+          ...(decision.source
+            ? {
+                selectedAuthMode: decision.source.mode,
+                selectedProfileId: decision.source.profileId,
+              }
+            : {}),
+        }
       : undefined;
   };
   const resolveProviderEvaluation = (
@@ -954,24 +1027,7 @@ export function createModelAuthAvailabilityResolver(
     }
     if (routeResolution.kind === "indeterminate") {
       const rejection = automaticSourceRejection(provider, ref, prepareAuthTarget(provider, ref));
-      if (rejection) {
-        return {
-          availability: false,
-          unavailableReason: rejection.unavailableReason,
-          ...(rejection.unavailableUntil !== undefined
-            ? { unavailableUntil: rejection.unavailableUntil }
-            : {}),
-          routeResolution,
-          ...(rejection.source
-            ? {
-                evidence: "profile" as const,
-                selectedAuthMode: rejection.source.mode,
-                selectedProfileId: rejection.source.profileId,
-              }
-            : { evidence: "profile" as const }),
-        };
-      }
-      return { availability: undefined, routeResolution };
+      return { ...(rejection ?? { availability: undefined }), routeResolution };
     }
     const modelLock = ref.lockedProfileId?.trim();
     const configuredAuthMode = resolveConfiguredOpenAIAuthMode(params.cfg);
@@ -1278,6 +1334,8 @@ export function createModelAuthAvailabilityResolver(
       left.localeCompare(right),
     ),
     evaluateModelAuth,
+    resolvePreparedRuntimeAuthMode: (provider) =>
+      params.preparedRuntimeAuthModes?.[normalizeProviderIdForAuth(provider)],
     resolveProviderAuthAvailability,
     hasSyntheticAuth: (provider) =>
       synthetic.has(normalizeProviderIdForAuth(provider)) ||
