@@ -11,6 +11,7 @@ import * as processRuntime from "openclaw/plugin-sdk/process-runtime";
 import type { SpawnResult } from "openclaw/plugin-sdk/process-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import plugin from "./index.js";
+import { createNodeBootstrapFixture } from "./src/crabbox-worker-node-enrollment.test-support.js";
 
 const PROFILE = {
   binary: "/mock/crabbox",
@@ -130,7 +131,7 @@ describe("Crabbox plugin generation lifecycle", () => {
         provider: backend,
       };
       try {
-        expect(generation.provider.resolveProvisionTimeoutMs?.(profile)).toBe(67 * 60_000);
+        expect(generation.provider.resolveProvisionTimeoutMs?.(profile)).toBe(153 * 60_000);
         expect(await generation.provider.listMachineOptions?.(profile)).toEqual([]);
         const waitForDeviceId = vi.fn(async () => "device-classless");
         const lease = await generation.provider.provision(profile, "classless-operation", {
@@ -144,7 +145,7 @@ describe("Crabbox plugin generation lifecycle", () => {
                 }
               : { mode: "resume" as const, deviceId: "device-classless" }),
             openclawVersion: "2026.8.1",
-            packageSpecs: ["openclaw@2026.8.1"],
+            nodeBootstrap: createNodeBootstrapFixture(),
             displayName: "Classless worker",
             waitForDeviceId,
           }),

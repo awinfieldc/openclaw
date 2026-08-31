@@ -219,6 +219,14 @@ accepted by the active Gateway runtime. Clients can compare it with
 needs a restart. `config.get.hash` remains the raw root-file revision used by
 config write conflict guards.
 
+`openclaw.setup.verify` additionally checks the Gateway's current application and
+restart state before and after its live inference probe. It returns
+`{ ok: false, status: "unavailable", error }` while saved settings are not active,
+restart work remains, or the verified runtime changes during the probe. Clients
+should preserve the selected model and retry after application or restart finishes.
+Standalone CLI verification still tests saved configuration without requiring a
+running Gateway.
+
 While the gateway is still finishing startup sidecars, `connect` can return a
 retryable `UNAVAILABLE` error with `details.reason: "startup-sidecars"` and
 `retryAfterMs`. Retry within your connection budget instead of treating it as
@@ -563,6 +571,8 @@ methods. Treat this as feature discovery, not a full enumeration of
 
   <Accordion title="Channels and login helpers">
     - `channels.status` returns built-in + bundled channel/plugin status summaries.
+    - `channels.start` (`operator.admin`) starts one channel account runtime without re-authenticating. Params `{ channel, accountId? }`; omitted `accountId` selects the default account. Responds `{ channel, accountId, started }`, with `started` true only when the resulting runtime snapshot reports `running: true`. This is not a provider-connectivity check; see [Per-account recovery](/cli/channels#per-account-recovery-non-destructive).
+    - `channels.stop` (`operator.admin`) stops one channel account runtime without clearing auth state. Params `{ channel, accountId? }`; omitted `accountId` selects the default account. Responds `{ channel, accountId, stopped }`, with `stopped` true when the resulting runtime snapshot does not report `running: true`. Unlike `channels.logout`, it retains the account's credentials.
     - `channels.logout` logs out a specific channel/account where the channel supports it.
     - `web.login.start` starts a QR/web login flow for the current QR-capable web channel provider.
     - `web.login.wait` waits for that flow to complete and starts the channel on success.
