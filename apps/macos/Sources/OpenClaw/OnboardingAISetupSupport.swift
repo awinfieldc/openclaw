@@ -145,6 +145,30 @@ extension OnboardingAISetupModel {
         let gatewayRestartRequired: Bool?
     }
 
+    static func activationWizardResult(
+        status: String?,
+        error: String?,
+        modelActivation: [String: AnyCodable]?) -> Result<ActivateResult, Error>
+    {
+        if status == "done",
+           let modelRef = modelActivation?["modelRef"]?.value as? String,
+           !modelRef.isEmpty
+        {
+            return .success(ActivateResult(
+                ok: true,
+                modelRef: modelRef,
+                status: nil,
+                error: nil,
+                gatewayRestartRequired: modelActivation?["gatewayRestartRequired"]?.value as? Bool))
+        }
+        if status == "cancelled" {
+            return .failure(OnboardingAISetupError.activationCancelled)
+        }
+        return .failure(status == "error"
+            ? OnboardingAISetupError.activationFailed(error ?? "AI setup failed.")
+            : OnboardingAISetupError.activationOutcomeUnavailable)
+    }
+
     struct Candidate: Identifiable, Equatable {
         let kind: String
         let label: String
@@ -210,17 +234,6 @@ extension OnboardingAISetupModel {
     }
 
     struct AuthOption: Identifiable, Equatable, Decodable {
-        static let activation = AuthOption(
-            id: "activation",
-            brandId: nil,
-            label: "Connect your AI",
-            hint: nil,
-            groupLabel: nil,
-            icon: nil,
-            website: nil,
-            kind: "activation",
-            featured: false)
-
         let id: String
         let brandId: String?
         let label: String
@@ -249,6 +262,36 @@ extension OnboardingAISetupModel {
         let brandId: String?
         let icon: String?
         let website: String?
+    }
+
+    /// Unconfirmed requests still carry cancellation intent when admission replies late.
+    enum ProviderAuthCancellation: Equatable {
+        case requesting
+        case unconfirmed
+    }
+
+    func activationAuthOption(for request: ActivationRequest) -> AuthOption {
+        let id: String
+        let presentation: CandidatePresentation?
+        switch request {
+        case let .candidate(kind, _, _, _):
+            id = kind
+            presentation = self.candidatePresentation[kind]
+        case let .manual(_, provider):
+            id = provider.id
+            presentation = CandidatePresentation(
+                brandId: provider.brandId, icon: provider.icon, website: provider.website)
+        }
+        return AuthOption(
+            id: id,
+            brandId: presentation?.brandId,
+            label: request.label,
+            hint: nil,
+            groupLabel: nil,
+            icon: presentation?.icon,
+            website: presentation?.website,
+            kind: "activation",
+            featured: false)
     }
 
     enum ProviderWizardKind: Equatable {
@@ -310,7 +353,7 @@ extension OnboardingAISetupModel {
     }
 
     func continueProviderAuth() {
-        guard let step = authStep else { return }
+        guard let step = authStep, wizardStepExecutor(step) != "gateway" else { return }
         let value: AnyCodable? = switch wizardStepType(step) {
         case "text": AnyCodable(self.authText)
         case "select": self.selectedAuthWizardOption?.value
@@ -436,8 +479,19 @@ extension OnboardingAISetupModel {
             : 150_000
     }
 
+    static func activationFailure(_ error: Error) -> Failure {
+        if case OnboardingAISetupError.activationCancelled = error {
+            return Failure(summary: error.localizedDescription, detail: nil)
+        }
+        return self.transportFailure(error.localizedDescription)
+    }
+
     static func activationFailureIsDefinitive(_ error: Error) -> Bool {
         if case OnboardingAISetupError.activationCancelled = error {
+            return true
+        }
+        // A terminal wizard error arrives after its runner and setup admission settle.
+        if case OnboardingAISetupError.activationFailed = error {
             return true
         }
         if let response = error as? GatewayResponseError {
@@ -504,6 +558,12 @@ extension OnboardingAISetupModel {
         return Failure(
             summary: self.friendlyTransportError(detail),
             detail: detail.isEmpty ? nil : detail)
+    }
+
+    static func providerAuthCancellationUnconfirmed() -> Failure {
+        Failure(
+            summary: "OpenClaw couldn’t confirm cancellation. Setup may still be running. Try Cancel again.",
+            detail: nil)
     }
 
     /// One friendly sentence per failure bucket.
