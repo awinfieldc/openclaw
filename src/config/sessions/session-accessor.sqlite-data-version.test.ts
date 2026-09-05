@@ -3,6 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { clearNodeSqliteKyselyCacheForDatabase } from "../../infra/kysely-sync.js";
+import { listUsageCountedTranscriptStats } from "../../infra/session-cost-usage-collection.js";
 import { configureSqliteConnectionPragmas } from "../../infra/sqlite-wal.js";
 import {
   closeOpenClawAgentDatabasesForTest,
@@ -11,8 +12,10 @@ import {
 } from "../../state/openclaw-agent-db.js";
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
 import {
+  appendTranscriptEventSync,
   appendTranscriptMessage,
   listSessionEntriesCore,
+  listSessionTranscriptInstances,
   loadSessionEntry,
   openSessionEntryReadView,
   upsertSessionEntryCore,
@@ -29,9 +32,13 @@ vi.mock("./session-accessor.sqlite-status.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./session-accessor.sqlite-status.js")>();
   return {
     ...actual,
-    parseSessionEntryJson: (row: Parameters<typeof actual.parseSessionEntryJson>[0]) => {
-      parseSessionEntryCalls(row.entry_json);
-      return actual.parseSessionEntryJson(row);
+    parseSessionEntryJson: (...args: Parameters<typeof actual.parseSessionEntryJson>) => {
+      // Snapshot/publication rows omit the current-id column; exact writer CAS reads
+      // share this decoder but are outside the cache work measured here.
+      if (args[0].current_session_id === undefined) {
+        parseSessionEntryCalls(args[0].entry_json);
+      }
+      return actual.parseSessionEntryJson(...args);
     },
   };
 });
@@ -115,6 +122,48 @@ function createSessionScope(label: string) {
 }
 
 describe("SQLite session entry cache", () => {
+  it("omits saved prompts from usage inventory while preserving full transcript reads", async () => {
+    const scope = createSessionScope("usage-inventory");
+    const sessionId = "usage-inventory";
+    const skillsSnapshot = { prompt: "unused usage snapshot α🦞".repeat(4096), skills: [] };
+    const worktree = { id: "usage-worktree", branch: "main", repoRoot: "/repo" };
+    await upsertSessionEntryCore(scope, { sessionId, updatedAt: 1, skillsSnapshot, worktree });
+    const event = { type: "session", id: sessionId };
+    expect(appendTranscriptEventSync({ ...scope, sessionId }, event).ok).toBe(true);
+    const database = openOpenClawAgentDatabase(scope);
+    const inventoryParams = { storePath: database.path, sessionsDir: path.dirname(database.path) };
+
+    parseSessionEntryCalls.mockClear();
+    const inventory = await listUsageCountedTranscriptStats(scope.agentId, inventoryParams);
+    expect(inventory).toEqual([
+      expect.objectContaining({
+        sessionId,
+        kind: "sqlite",
+        size: Buffer.byteLength(JSON.stringify(event)),
+        eventCount: 1,
+        maxSeq: 0,
+      }),
+    ]);
+    expect(parseSessionEntryCalls).toHaveBeenCalledOnce();
+    expect(
+      parseSessionEntryCalls.mock.calls.every(([json]) => Buffer.byteLength(json) < 1024),
+    ).toBe(true);
+    expect(await listUsageCountedTranscriptStats(scope.agentId, inventoryParams)).toEqual(
+      inventory,
+    );
+
+    const fullScope = { agentId: scope.agentId, env: scope.env };
+    for (const options of [{}, { sessionId }]) {
+      const full = listSessionTranscriptInstances(fullScope, options)[0];
+      const listed = listSessionTranscriptInstances(scope, options)[0];
+      expect(full?.entry.skillsSnapshot).toEqual(skillsSnapshot);
+      expect(listed).toEqual({ ...full, entry: { ...full?.entry, skillsSnapshot: undefined } });
+      expect(listed?.entry.worktree).not.toBe(full?.entry.worktree);
+      listed!.entry.worktree!.branch = "changed by reader";
+      expect(listSessionTranscriptInstances(scope, options)[0]?.entry.worktree).toEqual(worktree);
+    }
+  });
+
   it.each([
     ["malformed", "{", false],
     ["JSON5", '{sessionId:"raw",updatedAt:1}', false],
@@ -734,7 +783,7 @@ describe("SQLite session entry cache", () => {
   it("bypasses the cache in a transaction and reuses the persisted snapshot after rollback", async () => {
     const scope = createSessionScope("transaction-rollback");
     await upsertSessionEntryCore(scope, { label: "before", sessionId: "rollback", updatedAt: 1 });
-    const borrowedBefore = openSessionEntryReadView(scope).get(scope.sessionKey);
+    const borrowedBefore = listSessionEntriesCore({ ...scope, clone: false })[0]?.entry;
     expect(borrowedBefore?.label).toBe("before");
     if (!borrowedBefore) {
       throw new Error("missing seeded rollback entry");
@@ -752,7 +801,7 @@ describe("SQLite session entry cache", () => {
     ).toThrow("roll back cache probe");
 
     parseSessionEntryCalls.mockClear();
-    const borrowedAfter = openSessionEntryReadView(scope).get(scope.sessionKey);
+    const borrowedAfter = listSessionEntriesCore({ ...scope, clone: false })[0]?.entry;
     expect(borrowedAfter).toStrictEqual(borrowedBefore);
     expect(borrowedAfter?.label).toBe("before");
     expect(parseSessionEntryCalls).not.toHaveBeenCalled();

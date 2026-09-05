@@ -53,6 +53,7 @@ import type {
 } from "./diagnostic-session-recovery.js";
 import {
   diagnosticSessionStates,
+  retireDiagnosticSessionObservations,
   getDiagnosticSessionState,
   isDiagnosticSessionStateCurrent,
   pruneDiagnosticSessionStates,
@@ -63,7 +64,6 @@ import {
 } from "./diagnostic-session-state.js";
 import {
   installDiagnosticStabilityFatalHook,
-  resetDiagnosticStabilityBundleForTest,
   uninstallDiagnosticStabilityFatalHook,
 } from "./diagnostic-stability-bundle.js";
 import {
@@ -1325,6 +1325,7 @@ export function stopDiagnosticHeartbeat() {
   }
   lastDiagnosticHeartbeatTickAt = undefined;
   stopDiagnosticRunActivityTracking();
+  retireDiagnosticSessionObservations();
   stopDiagnosticLivenessSampler();
   stopDiagnosticStabilityRecorder();
   uninstallDiagnosticStabilityFatalHook();
@@ -1343,7 +1344,6 @@ function resetDiagnosticStateForTest(): void {
   resetDiagnosticMemoryForTest();
   resetDiagnosticPhasesForTest();
   resetDiagnosticStabilityRecorderForTest();
-  resetDiagnosticStabilityBundleForTest();
 }
 
 const testing = {

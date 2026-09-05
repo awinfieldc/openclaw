@@ -29,17 +29,17 @@ import type { CodexAttemptNotificationController } from "./run-attempt-notificat
 import type { CodexAttemptResources } from "./run-attempt-resources.js";
 import {
   clearCodexBindingAfterInvalidImagePayload,
-  markCodexAppServerBindingCoveredThroughTurn,
   shouldUseFreshCodexThreadAfterContextEngineOverflow,
 } from "./run-attempt-state.js";
 import type { prepareCodexAttemptTurnRequest } from "./run-attempt-turn-request.js";
 import type { CodexAttemptTurnState } from "./run-attempt-turn-state.js";
+import { assertCodexBindingMayBeReplaced } from "./session-binding.js";
 import { captureCodexSettledTurnFinalizationContext } from "./settled-turn-context.js";
 import { normalizeCodexTrajectoryError, recordCodexTrajectoryCompletion } from "./trajectory.js";
 import { codexTranscriptMirrorRuntime } from "./transcript-mirror.js";
+import { readMirrorIdentity } from "./upstream-prompt-provenance.js";
 import {
-  createCodexUsageLimitPromptError,
-  isCodexUsageLimitPromptError,
+  CodexUsageLimitPromptError,
   markCodexAuthProfileBlockedFromRateLimits,
   refreshCodexUsageLimitPromptError,
 } from "./usage-limit-error.js";
@@ -75,6 +75,21 @@ export async function finalizeCodexAttempt(
     startupAuthProfileId,
   } = connection;
   const { toolBridge, toolState } = attemptTools;
+  const canClearBindingForRecovery = (operation: string) => {
+    if (params.expectedSessionRuntimeOwnership) {
+      // Optional recovery preserves both native ownership and the completed turn's outcome.
+      embeddedAgentLog.warn(
+        "codex app-server preserved native binding instead of recovery rotation",
+        {
+          threadId: resourceState.thread.threadId,
+          operation,
+        },
+      );
+      return false;
+    }
+    assertCodexBindingMayBeReplaced(resourceState.thread, operation);
+    return true;
+  };
   const { state, completion, deadlines } = turnRuntime;
   const { emitLifecycleTerminal, buildLifecycleTerminalMeta } = lifecycle;
   const { drainNotificationQueue } = notifications;
@@ -82,6 +97,7 @@ export async function finalizeCodexAttempt(
   const {
     activeTurnId,
     activeProjector,
+    runtimeModelSelection,
     streamState,
     freezeRunTerminalOutcome,
     notifyUserMessagePersisted,
@@ -156,12 +172,17 @@ export async function finalizeCodexAttempt(
           ? formatErrorMessage(finalPromptError)
           : undefined;
   if (isInvalidCodexImagePayloadError(finalPromptErrorMessage)) {
-    await clearCodexBindingAfterInvalidImagePayload(bindingStore, bindingIdentity, {
-      phase: "turn_completed",
-      threadId: resourceState.thread.threadId,
-      turnId: activeTurnId,
-      error: finalPromptErrorMessage,
-    });
+    await clearCodexBindingAfterInvalidImagePayload(
+      bindingStore,
+      bindingIdentity,
+      {
+        phase: "turn_completed",
+        threadId: resourceState.thread.threadId,
+        turnId: activeTurnId,
+        error: finalPromptErrorMessage,
+      },
+      params.expectedSessionRuntimeOwnership,
+    );
   }
   if (
     resourceState.thread.connectionScope !== "supervision" &&
@@ -169,7 +190,8 @@ export async function finalizeCodexAttempt(
       error: finalPromptError,
       contextEngineActive: Boolean(activeContextEngine),
       thread: resourceState.thread,
-    })
+    }) &&
+    canClearBindingForRecovery("clearing a native context after overflow")
   ) {
     embeddedAgentLog.warn(
       "codex app-server context-engine turn overflowed after resume; clearing thread binding for recovery",
@@ -196,9 +218,9 @@ export async function finalizeCodexAttempt(
       authProfileId: startupAuthProfileId,
       rateLimits: refreshedUsageLimitPromptError.rateLimitsForProfile,
     });
-    finalPromptError = createCodexUsageLimitPromptError(refreshedUsageLimitPromptError.message);
+    finalPromptError = new CodexUsageLimitPromptError(refreshedUsageLimitPromptError.message);
   } else if (
-    isCodexUsageLimitPromptError(finalPromptError) &&
+    finalPromptError instanceof CodexUsageLimitPromptError &&
     state.rateLimitsRevisionBeforeLastTurnStart !== undefined &&
     readCodexRateLimitsRevision(resourceState.client) > state.rateLimitsRevisionBeforeLastTurnStart
   ) {
@@ -275,6 +297,33 @@ export async function finalizeCodexAttempt(
   });
   // Every terminal observer must see the same immutable outcome.
   freezeRunTerminalOutcome();
+  result.terminal = attemptTerminal.normalize({
+    timedOut: effectiveTimedOut,
+    aborted: finalAborted,
+    promptError: finalPromptError,
+    promptErrorSource: finalPromptErrorSource,
+  });
+  // Failure enrichment can change the outcome after projection. Update this turn's
+  // terminal rows before transcript hooks read them; earlier work keeps its own outcome.
+  for (const message of [
+    result.lastAssistant,
+    result.currentAttemptAssistant,
+    result.messagesSnapshot.find(
+      (candidate) => readMirrorIdentity(candidate) === `${activeTurnId}:assistant`,
+    ),
+  ]) {
+    if (message?.role === "assistant") {
+      const providerRefusal = message.diagnostics?.some(
+        (diagnostic) => diagnostic.type === "provider_refusal",
+      );
+      // The projector owns refusal classification. Preserve it unless a stronger
+      // local abort or prompt failure supersedes this turn's provider outcome.
+      if (!providerRefusal || finalAborted || finalPromptError) {
+        message.stopReason = finalAborted ? "aborted" : finalPromptError ? "error" : "stop";
+        message.errorMessage = finalPromptError ? formatErrorMessage(finalPromptError) : undefined;
+      }
+    }
+  }
   const modelCallFailureKind =
     classifyCodexModelCallFailureKind({
       error: finalPromptError,
@@ -312,20 +361,31 @@ export async function finalizeCodexAttempt(
     result.assistantTexts.every((text) => !text.trim()) &&
     result.messagesSnapshot.some((message) => message.role === "toolResult") &&
     (!finalPromptError || activeProjector.settledTurnFailureFinalizationAllowed);
+  // Supervised auth belongs to its native connection, which has no generic stock
+  // tool-free summary operation. Retain fallback eligibility instead of selecting host auth.
   const settledTurnFinalizationContext = shouldCaptureSettledTurnFinalizationContext
-    ? ((await captureCodexSettledTurnFinalizationContext({
-        ...activeTranscriptTarget,
-        mirroredMessages: mirrorOutcome.mirroredMessages,
-        settledMessages: result.messagesSnapshot,
-        turnId: activeTurnId,
-      })) ?? Object.freeze({ source: "unavailable" as const }))
+    ? ((!usesSupervisionConnection
+        ? await captureCodexSettledTurnFinalizationContext({
+            ...activeTranscriptTarget,
+            model: resourceState.thread.model,
+            modelProvider: resourceState.thread.modelProvider,
+            authProfileId: startupAuthProfileId,
+            mirroredMessages: mirrorOutcome.mirroredMessages,
+            settledMessages: result.messagesSnapshot,
+            turnId: activeTurnId,
+            signal: params.abortSignal,
+            assertActive: connection.assertCurrent,
+          })
+        : undefined) ?? Object.freeze({ source: "unavailable" as const }))
     : undefined;
   if (settledTurnFinalizationContext?.source === "unavailable") {
-    // Unavailable evidence forbids native inference, but must not revoke this
-    // eligible turn's path to the existing host-owned fallback.
     embeddedAgentLog.warn("codex settled-turn finalization context is unavailable", {
+      runId: params.runId,
       threadId: resourceState.thread.threadId,
       turnId: activeTurnId,
+      reason: usesSupervisionConnection
+        ? "native_auth_finalization_unsupported"
+        : "context_unavailable",
     });
   }
   runAgentHarnessLlmOutputHook({
@@ -385,41 +445,47 @@ export async function finalizeCodexAttempt(
     !finalPromptError;
   if (state.shouldDelayNativeHookRelayUnregister) {
     try {
-      await markCodexAppServerBindingCoveredThroughTurn({
-        bindingStore,
-        identity: bindingIdentity,
-        threadId: resourceState.thread.threadId,
-        // Only turns whose prompt WAS a no-engine continuity projection may
-        // calibrate: a dense direct or active-engine prompt must never persist a
-        // sample that later shrinks continuity history it did not measure.
-        // Normalized usage splits total input into uncached + cacheRead + cacheWrite;
-        // the density sample needs the full input cost, or the derived ratio loosens
-        // the continuity cap in the unsafe direction.
-        continuityCalibration: context.promptState.noEngineContinuityProjectionApplied
-          ? buildCodexContinuityCalibration({
-              promptChars: prompt.turnState.codexTurnPromptText.length,
-              inputTokens:
-                (result.attemptUsage?.input ?? 0) +
-                (result.attemptUsage?.cacheRead ?? 0) +
-                (result.attemptUsage?.cacheWrite ?? 0),
-            })
-          : undefined,
-      });
+      // Only no-engine continuity prompts may calibrate their measured history.
+      // Billing spans every model call; density needs only the latest full prompt.
+      const continuityCalibration = context.promptState.noEngineContinuityProjectionApplied
+        ? buildCodexContinuityCalibration({
+            promptChars: prompt.turnState.codexTurnPromptText.length,
+            inputTokens:
+              result.attemptUsage?.contextUsage?.state === "available"
+                ? (result.attemptUsage.contextUsage.promptTokens ?? 0)
+                : 0,
+          })
+        : undefined;
+      await bindingStore.mutate(
+        bindingIdentity,
+        {
+          kind: "patch",
+          threadId: resourceState.thread.threadId,
+          patch: {
+            historyCoveredThrough: new Date().toISOString(),
+            ...(continuityCalibration ? { continuityCalibration } : {}),
+          },
+        },
+        connection.assertCurrent,
+      );
     } catch (error) {
       if (resourceState.thread.connectionScope === "supervision") {
         throw error;
       }
-      const cleared = await bindingStore.mutate(bindingIdentity, {
-        kind: "clear",
-        threadId: resourceState.thread.threadId,
-      });
-      if (!cleared) {
-        throw error;
+      if (canClearBindingForRecovery("clearing native coverage after a completed turn")) {
+        const cleared = await bindingStore.mutate(
+          bindingIdentity,
+          { kind: "clear", threadId: resourceState.thread.threadId },
+          connection.assertCurrent,
+        );
+        if (!cleared) {
+          throw error;
+        }
+        embeddedAgentLog.warn(
+          "codex app-server binding coverage update failed after completed turn; cleared stale binding",
+          { threadId: resourceState.thread.threadId, turnId: activeTurnId, error },
+        );
       }
-      embeddedAgentLog.warn(
-        "codex app-server binding coverage update failed after completed turn; cleared stale binding",
-        { threadId: resourceState.thread.threadId, turnId: activeTurnId, error },
-      );
     }
   }
   recordCodexTrajectoryCompletion(trajectoryRecorder, {
@@ -473,15 +539,10 @@ export async function finalizeCodexAttempt(
   );
   // Preserve the exact result identity carrying host-issued TTS delivery provenance.
   const finalizedResult: EmbeddedRunAttemptResult = Object.assign(result, {
+    ...(runtimeModelSelection ? { runtimeModelSelection } : {}),
     ...(toolState.yieldAcknowledgment
       ? { yieldAcknowledgment: toolState.yieldAcknowledgment }
       : {}),
-    terminal: attemptTerminal.normalize({
-      timedOut: effectiveTimedOut,
-      aborted: finalAborted,
-      promptError: finalPromptError,
-      promptErrorSource: finalPromptErrorSource,
-    }),
     ...(codexAppServerFailure ? { codexAppServerFailure } : {}),
     ...(promptTimeoutOutcome ? { promptTimeoutOutcome } : {}),
     ...(assistantTranscriptOwned ? { assistantTranscriptOwned: true } : {}),
